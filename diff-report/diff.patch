@@ -1,0 +1,2568 @@
+--- a/single-cycle/alu.v
++++ b/single-cycle/alu.v
+@@ -1,30 +1,52 @@
++// ============================================================
++//  alu.v  —  单周期 RISC-V CPU 算术逻辑单元（Final 扩展版）
++//  作者：占锦翔
++//  说明：Zero 信号统一语义为"条件成立=1"：
++//        · B-type 比较类指令（bne/blt/bge/bltu/bgeu）：C!=0 即条件成立
++//        · beq/其他：C==0 即条件成立（保持原始 sub 结果语义）
++// ============================================================
+ `include "ctrl_encode_def.v"
+ 
+-module alu(A, B, ALUOp, C, Zero);
+-   input  signed [31:0] A, B;
+-   input         [4:0]  ALUOp;
+-   output signed [31:0] C;
+-   output Zero;  //condition flag: set if condition is true for B-type instruction
+-   
+-   reg [31:0] C;
+-   integer    i;
+-       
+-   always @( * ) begin
+-      case ( ALUOp )
+-      `ALUOp_lui:C=B;
+-      `ALUOp_add:C=A+B;
+-      `ALUOp_sub:C=A-B;  //and beq
+-      `ALUOp_xor:C=A^B;
+-      `ALUOp_or:C=A|B;
+-      `ALUOp_and:C=A&B;
+-      `ALUOp_sll:C=A<<B;
+-      `ALUOp_srl:C=A>>B;
+-      `ALUOp_sra:C=A>>>B;
+-      default: C=A;
+-      endcase
+-   end // end always
+-   
+-   assign Zero = (C == 32'b0);  
++module alu(
++    input  signed [31:0] A,
++    input  signed [31:0] B,
++    input         [4:0]  ALUOp,
++    output signed [31:0] C,
++    output               Zero   // 条件标志：条件成立时为 1
++);
+ 
++    reg [31:0] C;
++
++    always @(*) begin
++        case (ALUOp)
++            `ALUOp_lui:  C = B;                                          // lui: 直通立即数
++            `ALUOp_add:  C = A + B;                                      // add/addi/lw/sw/jalr 地址计算
++            `ALUOp_sub:  C = A - B;                                      // sub/beq 差值
++            `ALUOp_bne:  C = (A != B)  ? 32'd1 : 32'd0;                 // bne  条件
++            `ALUOp_blt:  C = ($signed(A) < $signed(B))  ? 32'd1 : 32'd0; // blt  有符号
++            `ALUOp_bge:  C = ($signed(A) >= $signed(B)) ? 32'd1 : 32'd0; // bge  有符号
++            `ALUOp_bltu: C = ($unsigned(A) < $unsigned(B))  ? 32'd1 : 32'd0; // bltu 无符号
++            `ALUOp_bgeu: C = ($unsigned(A) >= $unsigned(B)) ? 32'd1 : 32'd0; // bgeu 无符号
++            `ALUOp_slt:  C = ($signed(A) < $signed(B))  ? 32'd1 : 32'd0; // slt  有符号比较写回
++            `ALUOp_sltu: C = ($unsigned(A) < $unsigned(B)) ? 32'd1 : 32'd0; // sltu 无符号比较写回
++            `ALUOp_xor:  C = A ^ B;                                      // xor/xori
++            `ALUOp_or:   C = A | B;                                      // or/ori
++            `ALUOp_and:  C = A & B;                                      // and/andi
++            `ALUOp_sll:  C = A << B[4:0];                               // sll/slli：移位量低5位
++            `ALUOp_srl:  C = $unsigned(A) >> B[4:0];                    // srl/srli：逻辑右移
++            `ALUOp_sra:  C = $signed(A)  >>> B[4:0];                    // sra/srai：算术右移
++            default:     C = A;
++        endcase
++    end
++
++    // Zero 语义：
++    //   B-type 比较指令 → C==1 表示条件成立，即 Zero=1 表示跳转
++    //   beq(sub) / 其他 → C==0 表示相等，即 Zero=1 表示跳转
++    assign Zero = (ALUOp == `ALUOp_bne  ||
++                   ALUOp == `ALUOp_blt  ||
++                   ALUOp == `ALUOp_bge  ||
++                   ALUOp == `ALUOp_bltu ||
++                   ALUOp == `ALUOp_bgeu) ? (C != 32'b0)
++                                         : (C == 32'b0);
++
+ endmodule
+-    
+
+--- a/single-cycle/ctrl.v
++++ b/single-cycle/ctrl.v
+@@ -1,106 +1,188 @@
+- `include "ctrl_encode_def.v"
++// ============================================================
++//  ctrl.v  —  单周期 RISC-V CPU 控制器（Final 扩展版）
++//  作者：占锦翔
++//  说明：在 lab-6 基础上已完整支持以下扩展指令：
++//        R-type: add, sub, slt, sltu, xor, or, and, sll, srl, sra
++//        I-arith: addi, slti, sltiu, xori, ori, andi, slli, srli, srai
++//        I-load : lw
++//        S-type : sw
++//        B-type : beq, bne, blt, bge, bltu, bgeu
++//        J-type : jal, jalr
++//        U-type : lui
++// ============================================================
++`include "ctrl_encode_def.v"
+ 
+-module ctrl(Op, Funct7, Funct3, Zero, 
+-            RegWrite, MemWrite,
+-            EXTOp, ALUOp, NPCOp, 
+-            ALUSrc, WDSel
+-            );
+-            
+-   input  [6:0] Op;       // opcode
+-   input  [6:0] Funct7;    // funct7
+-   input  [2:0] Funct3;    // funct3
+-   input        Zero;
+-   
+-   output       RegWrite; // control signal for register write
+-   output       MemWrite; // control signal for memory write
+-   output [5:0] EXTOp;    // control signal to signed extension
+-   output [4:0] ALUOp;    // ALU opertion
+-   output [2:0] NPCOp;    // next pc operation
+-   output       ALUSrc;   // ALU source for B 
+-   output [1:0] WDSel;    // (register) write data selection
+-   
+-   //Op[6]&Op[5]&Op[4]&Op[3]&Op[2]&Op[1]&Op[0];
+-   
+-   //LUI
+-   wire LUI = ~Op[6]&Op[5]&Op[4]&~Op[3]&Op[2]&Op[1]&Op[0];
+-      
+-  // r format 0110011
+-    wire rtype  = ~Op[6]&Op[5]&Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0110011
+-    wire i_add  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]&~Funct3[2]&~Funct3[1]&~Funct3[0]; // add 0000000 000
+-    wire i_sub  = rtype& ~Funct7[6]& Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]&~Funct3[2]&~Funct3[1]&~Funct3[0]; // sub 0100000 000
+-    wire i_or   = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]& Funct3[1]&~Funct3[0]; // or 0000000 110
+-    wire i_and  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]& Funct3[1]& Funct3[0]; // and 0000000 111
+-    wire i_xor  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]&~Funct3[1]&~Funct3[0]; // xor 0000000 100
+-    wire i_sll  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]&~Funct3[2]&~Funct3[1]& Funct3[0]; // sll 0000000 001
+-    wire i_srl  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]&~Funct3[1]& Funct3[0]; // srl 0000000 101
+-    wire i_sra  = rtype& ~Funct7[6]& Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]&~Funct3[1]& Funct3[0]; // sra 0100000 101
++module ctrl(
++    input  [6:0] Op,
++    input  [6:0] Funct7,
++    input  [2:0] Funct3,
++    input        Zero,       // ALU 条件标志（由 alu.v 根据 ALUOp 语义定义）
+ 
+- // i format load 0000011
+-    wire itype_l  = ~Op[6]&~Op[5]&~Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0000011
+-    wire i_lw = itype_l&~Funct3[2]& Funct3[1]&~Funct3[0];//lw 010
++    output reg       RegWrite,
++    output reg       MemWrite,
++    output reg [5:0] EXTOp,
++    output reg [4:0] ALUOp,
++    output reg [2:0] NPCOp,
++    output reg       ALUSrc,
++    output reg [1:0] WDSel
++);
+ 
+-  // i format 0010011
+-    wire itype_r  = ~Op[6]&~Op[5]&Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0010011
+-    wire i_addi  =  itype_r& ~Funct3[2]& ~Funct3[1]& ~Funct3[0]; // addi 000
+-    	
+-  // s format 0100011
+-    wire stype  = ~Op[6]&Op[5]&~Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0100011
+-    wire i_sw   =  stype& ~Funct3[2]& Funct3[1]&~Funct3[0]; // sw 010
++    always @(*) begin
++        // 默认值：NOP 行为
++        RegWrite = 1'b0;
++        MemWrite = 1'b0;
++        EXTOp    = 6'b0;
++        ALUOp    = `ALUOp_nop;
++        NPCOp    = `NPC_PLUS4;
++        ALUSrc   = 1'b0;
++        WDSel    = `WDSel_FromALU;
+ 
+-  // sb format 1100011
+-    wire sbtype  = Op[6]&Op[5]&~Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0];//1100011
+-    wire i_beq  = sbtype& ~Funct3[2]& ~Funct3[1]&~Funct3[0]; // beq 000
++        case (Op)
++        //----------------------------------------------------
++        // LUI: U-type，rd = imm << 12
++        //----------------------------------------------------
++        7'b0110111: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_UTYPE;
++            ALUOp    = `ALUOp_lui;
++        end
+ 
+-  // j format
+-    wire i_jal  = Op[6]& Op[5]&~Op[4]& Op[3]& Op[2]& Op[1]& Op[0];  // jal 1101111
++        //----------------------------------------------------
++        // R-type: 0110011
++        // add, sub, slt, sltu, xor, or, and, sll, srl, sra
++        //----------------------------------------------------
++        7'b0110011: begin
++            RegWrite = 1'b1;
++            case ({Funct7, Funct3})
++                {7'b0000000, 3'b000}: ALUOp = `ALUOp_add;   // add
++                {7'b0100000, 3'b000}: ALUOp = `ALUOp_sub;   // sub
++                {7'b0000000, 3'b010}: ALUOp = `ALUOp_slt;   // slt
++                {7'b0000000, 3'b011}: ALUOp = `ALUOp_sltu;  // sltu
++                {7'b0000000, 3'b100}: ALUOp = `ALUOp_xor;   // xor
++                {7'b0000000, 3'b110}: ALUOp = `ALUOp_or;    // or
++                {7'b0000000, 3'b111}: ALUOp = `ALUOp_and;   // and
++                {7'b0000000, 3'b001}: ALUOp = `ALUOp_sll;   // sll
++                {7'b0000000, 3'b101}: ALUOp = `ALUOp_srl;   // srl
++                {7'b0100000, 3'b101}: ALUOp = `ALUOp_sra;   // sra
++                default: begin
++                    RegWrite = 1'b0;
++                    ALUOp    = `ALUOp_nop;
++                end
++            endcase
++        end
+ 
+-  // generate control signals
+-  assign RegWrite   = rtype | itype_r | LUI | itype_l; // register write
+-  assign MemWrite   = stype;                           // memory write
+-  assign ALUSrc     = itype_r | LUI | itype_l | stype;   // ALU B is from instruction immediate
++        //----------------------------------------------------
++        // I-type arithmetic: 0010011
++        // addi, slti, sltiu, xori, ori, andi, slli, srli, srai
++        //----------------------------------------------------
++        7'b0010011: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_ITYPE;
++            case (Funct3)
++                3'b000: ALUOp = `ALUOp_add;   // addi
++                3'b010: ALUOp = `ALUOp_slt;   // slti  (有符号)
++                3'b011: ALUOp = `ALUOp_sltu;  // sltiu (无符号，立即数符号扩展后无符号比较)
++                3'b100: ALUOp = `ALUOp_xor;   // xori
++                3'b110: ALUOp = `ALUOp_or;    // ori
++                3'b111: ALUOp = `ALUOp_and;   // andi
++                3'b001: ALUOp = (Funct7 == 7'b0000000) ? `ALUOp_sll : `ALUOp_nop; // slli
++                3'b101: ALUOp = (Funct7 == 7'b0100000) ? `ALUOp_sra : `ALUOp_srl; // srai/srli
++                default: begin
++                    RegWrite = 1'b0;
++                    ALUOp    = `ALUOp_nop;
++                end
++            endcase
++        end
+ 
+-  // signed extension
+-  // EXT_CTRL_ITYPE_SHAMT 6'b100000
+-  // EXT_CTRL_ITYPE	      6'b010000
+-  // EXT_CTRL_STYPE	      6'b001000
+-  // EXT_CTRL_BTYPE	      6'b000100
+-  // EXT_CTRL_UTYPE	      6'b000010
+-  // EXT_CTRL_JTYPE	      6'b000001
+-  assign EXTOp[5]    = 0;
+-  assign EXTOp[4]    = i_addi | itype_l;
+-  assign EXTOp[3]    = stype; 
+-  assign EXTOp[2]    = sbtype; 
+-  assign EXTOp[1]    = LUI;
+-  assign EXTOp[0]    = i_jal;         
+-  
+-  // WDSel_FromALU 2'b00
+-  // WDSel_FromMEM 2'b01
+-  // WDSel_FromPC  2'b10 
+-    assign WDSel[1] = i_jal;
+-    assign WDSel[0] = itype_l;
++        //----------------------------------------------------
++        // I-type load: 0000011  lw
++        //----------------------------------------------------
++        7'b0000011: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_ITYPE;
++            ALUOp    = `ALUOp_add;
++            WDSel    = `WDSel_FromMEM;
++        end
+ 
+-  // NPC_PLUS4   3'b000
+-  // NPC_BRANCH  3'b001
+-  // NPC_JUMP    3'b010
+-  // NPC_JALR	   3'b100
+-    assign NPCOp[2] = 0;
+-    assign NPCOp[1] = i_jal;
+-    assign NPCOp[0] = sbtype & Zero;
++        //----------------------------------------------------
++        // S-type: 0100011  sw
++        //----------------------------------------------------
++        7'b0100011: begin
++            MemWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_STYPE;
++            ALUOp    = `ALUOp_add;
++        end
+ 
+-// ALUOp_nop 5'b00000
+-// ALUOp_lui 5'b00001
+-// ALUOp_add 5'b00011
+-// ALUOp_sub 5'b00100
+-// ALUOp_xor 5'b01100
+-// ALUOp_or 5'b01101
+-// ALUOp_and 5'b01110
+-// ALUOp_sll 5'b01111
+-// ALUOp_srl 5'b10000
+-// ALUOp_sra 5'b10001
+-    assign ALUOp[4] = i_srl | i_sra;
+-    assign ALUOp[3] = i_and | i_or | i_sll | i_xor;
+-    assign ALUOp[2] = i_and | i_or | i_sub | i_beq | i_sll | i_xor;
+-    assign ALUOp[1] = i_addi | i_add | i_and | i_sll | itype_l | stype ;
+-	  assign ALUOp[0] = i_addi | i_add | i_or | LUI | i_sll | i_sra | itype_l | stype ;
++        //----------------------------------------------------
++        // B-type: 1100011  beq, bne, blt, bge, bltu, bgeu
++        // Zero 信号由 alu.v 统一定义为"条件成立=1"
++        //----------------------------------------------------
++        7'b1100011: begin
++            EXTOp = `EXT_CTRL_BTYPE;
++            case (Funct3)
++                3'b000: begin // beq:  条件 A==B，ALU 做 sub，Zero=(C==0)
++                    ALUOp = `ALUOp_sub;
++                    NPCOp = Zero ? `NPC_BRANCH : `NPC_PLUS4;
++                end
++                3'b001: begin // bne:  条件 A!=B
++                    ALUOp = `ALUOp_bne;
++                    NPCOp = Zero ? `NPC_BRANCH : `NPC_PLUS4;
++                end
++                3'b100: begin // blt:  有符号 A<B
++                    ALUOp = `ALUOp_blt;
++                    NPCOp = Zero ? `NPC_BRANCH : `NPC_PLUS4;
++                end
++                3'b101: begin // bge:  有符号 A>=B
++                    ALUOp = `ALUOp_bge;
++                    NPCOp = Zero ? `NPC_BRANCH : `NPC_PLUS4;
++                end
++                3'b110: begin // bltu: 无符号 A<B
++                    ALUOp = `ALUOp_bltu;
++                    NPCOp = Zero ? `NPC_BRANCH : `NPC_PLUS4;
++                end
++                3'b111: begin // bgeu: 无符号 A>=B
++                    ALUOp = `ALUOp_bgeu;
++                    NPCOp = Zero ? `NPC_BRANCH : `NPC_PLUS4;
++                end
++                default: begin
++                    ALUOp = `ALUOp_nop;
++                    NPCOp = `NPC_PLUS4;
++                end
++            endcase
++        end
+ 
++        //----------------------------------------------------
++        // J-type: 1101111  jal
++        // rd = PC+4, PC = PC + imm
++        //----------------------------------------------------
++        7'b1101111: begin
++            RegWrite = 1'b1;
++            EXTOp    = `EXT_CTRL_JTYPE;
++            NPCOp    = `NPC_JUMP;
++            WDSel    = `WDSel_FromPC;
++        end
++
++        //----------------------------------------------------
++        // I-type jump: 1100111  jalr
++        // rd = PC+4, PC = (rs1 + imm) & ~1
++        //----------------------------------------------------
++        7'b1100111: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_ITYPE;
++            ALUOp    = `ALUOp_add;
++            NPCOp    = `NPC_JALR;
++            WDSel    = `WDSel_FromPC;
++        end
++
++        default: begin
++            RegWrite = 1'b0;
++            MemWrite = 1'b0;
++        end
++        endcase
++    end
+ endmodule
+
+--- a/single-cycle/ctrl_encode_def.v
++++ b/single-cycle/ctrl_encode_def.v
+@@ -1,56 +1,55 @@
+ `timescale 1ns/1ns
+ 
+ // NPC control signal
+ `define NPC_PLUS4   3'b000
+ `define NPC_BRANCH  3'b001
+ `define NPC_JUMP    3'b010
+ `define NPC_JALR    3'b100
+ 
+ // ALU control signal
+ `define ALU_NOP   3'b000 
+ `define ALU_ADD   3'b001
+ `define ALU_SUB   3'b010 
+ `define ALU_AND   3'b011
+ `define ALU_OR    3'b100
+ 
+ //EXT CTRL itype, stype, btype, utype, jtype
+ `define EXT_CTRL_ITYPE_SHAMT 6'b100000
+ `define EXT_CTRL_ITYPE	6'b010000
+ `define EXT_CTRL_STYPE	6'b001000
+ `define EXT_CTRL_BTYPE	6'b000100
+ `define EXT_CTRL_UTYPE	6'b000010
+ `define EXT_CTRL_JTYPE	6'b000001
+ 
+ `define GPRSel_RD 2'b00
+ `define GPRSel_RT 2'b01
+ `define GPRSel_31 2'b10
+ 
+ `define WDSel_FromALU 2'b00
+ `define WDSel_FromMEM 2'b01
+-`define WDSel_FromPC 2'b10
++`define WDSel_FromPC  2'b10
+ 
+-`define ALUOp_nop 5'b00000
+-`define ALUOp_lui 5'b00001
++`define ALUOp_nop  5'b00000
++`define ALUOp_lui  5'b00001
+ `define ALUOp_auipc 5'b00010
+-`define ALUOp_add 5'b00011
+-`define ALUOp_sub 5'b00100
+-`define ALUOp_bne 5'b00101
+-`define ALUOp_blt 5'b00110
+-`define ALUOp_bge 5'b00111
++`define ALUOp_add  5'b00011
++`define ALUOp_sub  5'b00100
++`define ALUOp_bne  5'b00101
++`define ALUOp_blt  5'b00110
++`define ALUOp_bge  5'b00111
+ `define ALUOp_bltu 5'b01000
+ `define ALUOp_bgeu 5'b01001
+-`define ALUOp_slt 5'b01010
++`define ALUOp_slt  5'b01010
+ `define ALUOp_sltu 5'b01011
+-`define ALUOp_xor 5'b01100
+-`define ALUOp_or 5'b01101
+-`define ALUOp_and 5'b01110
+-`define ALUOp_sll 5'b01111
+-`define ALUOp_srl 5'b10000
+-`define ALUOp_sra 5'b10001
++`define ALUOp_xor  5'b01100
++`define ALUOp_or   5'b01101
++`define ALUOp_and  5'b01110
++`define ALUOp_sll  5'b01111
++`define ALUOp_srl  5'b10000
++`define ALUOp_sra  5'b10001
+ 
+-`define dm_word 3'b000
+-`define dm_halfword 3'b001
++`define dm_word              3'b000
++`define dm_halfword          3'b001
+ `define dm_halfword_unsigned 3'b010
+-`define dm_byte 3'b011
+-`define dm_byte_unsigned 3'b100
+-
++`define dm_byte              3'b011
++`define dm_byte_unsigned     3'b100
+
+--- a/single-cycle/dm.v
++++ b/single-cycle/dm.v
+@@ -1,23 +1,20 @@
+ `include "ctrl_encode_def.v"
+ // data memory
+ module dm(clk, DMWr, addr, din, dout);
+    input          clk;
+    input          DMWr;
+    input  [31:0]  addr;
+    input  [31:0]  din;
+    output reg [31:0]  dout;
+    
+    reg [31:0] dmem[127:0];
+    
+    always @(posedge clk)
+       if (DMWr) begin
+          dmem[addr[8:2]] <= din;
+-         $write(" memaddr = %h, memdata = %h", addr[31:0], din);
+       end
+    
+-     //load
+-     always @(*) begin
++   always @(*) begin
+          dout <= dmem[addr[8:2]];
+-     end
+-     
+-endmodule    
++   end
++endmodule
+
+--- a/single-cycle/EXT.v
++++ b/single-cycle/EXT.v
+@@ -1,23 +1,39 @@
++// ============================================================
++//  EXT.v  —  单周期 RISC-V CPU 立即数扩展模块（Final 版）
++//  作者：占锦翔
++//  说明：支持 I/S/B/U/J 五种立即数格式的符号扩展
++// ============================================================
+ `include "ctrl_encode_def.v"
+-module EXT( 
+-    input	[11:0]			iimm, //instr[31:20], 12 bits
+-	input	[11:0]			simm, //instr[31:25, 11:7], 12 bits
+-	input	[11:0]			bimm, //instrD[31], instrD[7], instrD[30:25], instrD[11:8], 12 bits
+-	input	[19:0]			uimm, //U type
+-	input	[19:0]			jimm, //J type
+-	input	[5:0]			EXTOp,
+ 
+-	output	reg [31:0] 	    immout
+-	);
++module EXT(
++    input  [11:0] iimm,    // I-type: instr[31:20]
++    input  [11:0] simm,    // S-type: {instr[31:25], instr[11:7]}
++    input  [11:0] bimm,    // B-type: {instr[31], instr[7], instr[30:25], instr[11:8]}
++    input  [19:0] uimm,    // U-type: instr[31:12]
++    input  [19:0] jimm,    // J-type: {instr[31], instr[19:12], instr[20], instr[30:21]}
++    input  [5:0]  EXTOp,
++    output reg [31:0] immout
++);
+ 
+-always  @(*)
+-	 case (EXTOp)
+-		`EXT_CTRL_ITYPE:	immout <= {{20{iimm[11]}}, iimm[11:0]};
+-		`EXT_CTRL_STYPE:	immout <= {{20{simm[11]}}, simm[11:0]};
+-		`EXT_CTRL_BTYPE:    immout <= {{19{bimm[11]}}, bimm[11:0], 1'b0};
+-		`EXT_CTRL_UTYPE:	immout <= {uimm[19:0], 12'b0};     //???????????12??0
+-		`EXT_CTRL_JTYPE:	immout <= {{21{jimm[19]}}, jimm[19:0], 1'b0};
+-		default:	        immout <= 32'b0;
+-	 endcase
+-       
++    always @(*) begin
++        case (EXTOp)
++            // I-type：12位有符号扩展到32位（slli/srli/srai 的 shamt 也走此路径，取 [4:0]）
++            `EXT_CTRL_ITYPE: immout = {{20{iimm[11]}}, iimm[11:0]};
++
++            // S-type：12位有符号扩展
++            `EXT_CTRL_STYPE: immout = {{20{simm[11]}}, simm[11:0]};
++
++            // B-type：12位有符号扩展后左移1位（最低位补0，对应字节对齐偏移）
++            `EXT_CTRL_BTYPE: immout = {{19{bimm[11]}}, bimm[11:0], 1'b0};
++
++            // U-type：20位立即数置于 [31:12]，低12位补0
++            `EXT_CTRL_UTYPE: immout = {uimm[19:0], 12'b0};
++
++            // J-type：20位有符号扩展后左移1位
++            `EXT_CTRL_JTYPE: immout = {{11{jimm[19]}}, jimm[19:0], 1'b0};
++
++            default: immout = 32'b0;
++        endcase
++    end
++
+ endmodule
+
+--- a/single-cycle/im.v
++++ b/single-cycle/im.v
+@@ -1,6 +1,6 @@
+ // instruction memory
+ module im(input  [31:2]  addr, output [31:0] dout);
+   reg  [31:0] RAM[127:0];
+ 
+   assign dout = RAM[addr]; // word aligned
+-endmodule  
++endmodule
+
+--- a/single-cycle/NPC.v
++++ b/single-cycle/NPC.v
+@@ -1,21 +1,29 @@
++// ============================================================
++//  NPC.v  —  单周期 RISC-V CPU 下一条 PC 计算模块（Final 版）
++//  作者：占锦翔
++//  说明：支持 PC+4、B-type 分支、JAL 跳转、JALR 跳转
++// ============================================================
+ `include "ctrl_encode_def.v"
+ 
+-module NPC( PC, NPCOp, IMM, NPC );  // next pc module
+-   input  [31:0] PC;        // pc
+-   input  [2:0]  NPCOp;     // next pc operation
+-   input  [31:0] IMM;       // immediate
+-   output reg [31:0] NPC;   // next pc
+-   
+-   wire [31:0] PCPLUS4;
+-   assign PCPLUS4 = PC + 4; // pc + 4
+-   
+-   always @(*) begin
+-      case (NPCOp)
+-          `NPC_PLUS4:  NPC = PCPLUS4;   // NPC computes addr
+-          `NPC_BRANCH: NPC = PC+IMM;    //B type, NPC computes addr
+-          `NPC_JUMP:   NPC = PC+IMM;    //J type, NPC computes addr
+-          default:     NPC = PCPLUS4;
+-      endcase
+-   end 
+-   
++module NPC(
++    input  [31:0] PC,       // 当前 PC
++    input  [2:0]  NPCOp,    // 控制信号
++    input  [31:0] IMM,      // 符号扩展后的立即数
++    input  [31:0] RS1,      // jalr 所用的 rs1 寄存器值
++    output reg [31:0] NPC   // 下一条 PC
++);
++
++    wire [31:0] PCPLUS4;
++    assign PCPLUS4 = PC + 4;
++
++    always @(*) begin
++        case (NPCOp)
++            `NPC_PLUS4:  NPC = PCPLUS4;                         // 顺序执行
++            `NPC_BRANCH: NPC = PC + IMM;                        // B-type 分支目标
++            `NPC_JUMP:   NPC = PC + IMM;                        // JAL 跳转目标
++            `NPC_JALR:   NPC = (RS1 + IMM) & 32'hFFFF_FFFE;    // JALR：最低位清零
++            default:     NPC = PCPLUS4;
++        endcase
++    end
++
+ endmodule
+
+--- a/single-cycle/PC.v
++++ b/single-cycle/PC.v
+@@ -1,15 +1,13 @@
+ module PC( clk, rst, NPC, PC );
+   input              clk;
+   input              rst;
+   input       [31:0] NPC;
+   output reg  [31:0] PC;
+  
+    always @(posedge clk, posedge rst) begin
+      if (rst) 
+         PC <= 32'h0000_0000;
+      else 
+         PC <= NPC;
+-        $write("\n pc = %h: ", PC);
+    end 
+- endmodule
+-
++endmodule
+
+--- a/single-cycle/RF.v
++++ b/single-cycle/RF.v
+@@ -1,33 +1,32 @@
+-  module RF(   input         clk, 
+-               input         rst,
+-               input         RFWr, 
+-               input  [4:0]  A1, A2, A3, 
+-               input  [31:0] WD, 
+-               output [31:0] RD1, RD2,
+-               input  [4:0]  reg_sel,
+-               output [31:0] reg_data
+-           );
++module RF(
++    input         clk, 
++    input         rst,
++    input         RFWr, 
++    input  [4:0]  A1, A2, A3, 
++    input  [31:0] WD, 
++    output [31:0] RD1, RD2,
++    input  [4:0]  reg_sel,
++    output [31:0] reg_data
++);
+ 
+     reg [31:0] rf[31:0];
+     integer i;
+ 
+     always @(posedge clk, posedge rst) begin
+-      if (rst) begin    //  reset
++      if (rst) begin
+         for (i=1; i<32; i=i+1)
+-            rf[i] <= 0; 
++            rf[i] <= 0;
+       end
+-      
+       else 
+         if (RFWr) begin
+           if(A3 != 5'b0) begin
+               rf[A3] <= WD;
+-              $write("x%d = %h  ", A3, WD);
+           end
+         end
+-      end
++    end
+ 
+     assign RD1 = (A1 != 0) ? rf[A1] : 0;
+     assign RD2 = (A2 != 0) ? rf[A2] : 0;
+     assign reg_data = (reg_sel != 0) ? rf[reg_sel] : 0; 
+ 
+-  endmodule 
++endmodule
+
+--- a/single-cycle/sccomp.v
++++ b/single-cycle/sccomp.v
+@@ -1,64 +1,41 @@
+ `include "ctrl_encode_def.v"
+ module sccomp(clk, rstn, reg_sel, reg_data);
+    input          clk, rstn; 
+    input [4:0]    reg_sel;
+    output [31:0]  reg_data;
+    
+    wire [31:0]    instr;
+    wire [31:0]    PC;
+    wire           MemWrite;
+    wire [31:0]    dm_addr, dm_din, dm_dout;
+    
+    wire reset;
+    assign reset = rstn;
+    
+    // instantiation of single-cycle CPU   
+    SCCPU U_SCCPU(
+-         .clk(clk),                   // input:  cpu clock
+-         .reset(reset),               // input:  reset
+-         .inst_in(instr),             // input:  instruction
+-         .Data_in(dm_dout),           // input:  data to cpu  
+-         .mem_w(MemWrite),            // output: memory write signal
+-         .PC_out(PC),                 // output: PC to im
+-         .Addr_out(dm_addr),          // output: address from cpu to memory/dm
+-         .Data_out(dm_din),           // output: data from cpu to memory/dm
+-         .reg_sel(reg_sel),         // input:  register selection
+-         .reg_data(reg_data)        // output: register data
++         .clk(clk),
++         .reset(reset),
++         .inst_in(instr),
++         .Data_in(dm_dout),
++         .mem_w(MemWrite),
++         .PC_out(PC),
++         .Addr_out(dm_addr),
++         .Data_out(dm_din),
++         .reg_sel(reg_sel),
++         .reg_data(reg_data)
+          );
+    
+    dm    U_DM(
+-         .clk(clk),           // input:  cpu clock
+-         .DMWr(MemWrite),     // input:  ram write
+-         .addr(dm_addr),      // input:  ram address
+-         .din(dm_din),         // input:  data to ram
+-         .dout(dm_dout)        // output: data from ram
++         .clk(clk),
++         .DMWr(MemWrite),
++         .addr(dm_addr),
++         .din(dm_din),
++         .dout(dm_dout)
+          );
+          
+-  // instantiation of intruction memory (used for simulation)
+    im    U_imem ( 
+-         .addr(PC[31:2]),     // input:  rom address
+-         .dout(instr)        // output: instruction
++         .addr(PC[31:2]),
++         .dout(instr)
+          );
+-  
+ endmodule
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+
+--- a/single-cycle/sccomp_tb.v
++++ b/single-cycle/sccomp_tb.v
+@@ -1,25 +0,0 @@
+-`timescale 1ns/1ns 
+-module sccomp_tb();
+-   reg    clk, rstn;
+-   reg  [4:0] reg_sel;
+-   wire [31:0] reg_data;
+-
+-   // instantiation of sccomp
+-   sccomp sccomp(.clk(clk), .rstn(rstn), .reg_sel(reg_sel), .reg_data(reg_data));
+-
+-   initial begin
+-     // input instructions for simulation, rv32_sc_sim
+-      $readmemh("rv32_sc_sim.dat", sccomp.U_imem.RAM);
+-
+-      clk = 1;
+-      rstn = 1;
+-      #10 ;
+-      rstn = 0;
+-      reg_sel = 7;
+-   end
+-   
+-   always begin
+-      #(5) clk = ~clk;
+-   end
+-   
+-endmodule
+
+--- a/single-cycle/SCCPU.v
++++ b/single-cycle/SCCPU.v
+@@ -1,102 +1,110 @@
++// ============================================================
++//  SCCPU.v  —  单周期 RISC-V CPU 顶层（Final 扩展版）
++//  作者：占锦翔
++//  说明：整合 ctrl / alu / NPC / EXT / RF / PC 各子模块
++// ============================================================
+ `include "ctrl_encode_def.v"
++
+ module SCCPU(
+-    input      clk,            // clock
+-    input      reset,          // reset
+-    input [31:0]  inst_in,     // instruction
+-    input [31:0]  Data_in,     // data from data memory
+-   
+-    output    mem_w,          // output: memory write signal
+-    output [31:0] PC_out,     // PC address
+-      // memory write
+-    output [31:0] Addr_out,   // ALU output
+-    output [31:0] Data_out,   // data to write data memory
++    input         clk,
++    input         reset,
++    input  [31:0] inst_in,     // 来自指令存储器
++    input  [31:0] Data_in,     // 来自数据存储器
+ 
+-    input  [4:0] reg_sel,    // register selection (for debug use)
+-    output [31:0] reg_data  // selected register data (for debug use)
+-    );
++    output        mem_w,       // 数据存储器写使能
++    output [31:0] PC_out,      // 当前 PC（指令存储器地址）
++    output [31:0] Addr_out,    // ALU 结果（数据存储器地址）
++    output [31:0] Data_out,    // 写入数据存储器的数据
+ 
+-    wire        RegWrite;    // control signal to register write
+-    wire [5:0]  EXTOp;       // control signal to signed extension
+-    wire [4:0]  ALUOp;       // ALU opertion
+-    wire [2:0]  NPCOp;       // next PC operation
+-    wire [1:0]  WDSel;       // (register) write data selection
+-    wire        ALUSrc;      // ALU source for B
+-    wire        Zero;        // ALU ouput zero
+-    wire [31:0] NPC;         // next PC
+-    wire [4:0]  rs1;          // rs
+-    wire [4:0]  rs2;          // rt
+-    wire [4:0]  rd;          // rd
+-    wire [6:0]  Op;          // opcode
+-    wire [6:0]  Funct7;       // funct7
+-    wire [2:0]  Funct3;       // funct3
+-    wire [11:0] Imm12;       // 12-bit immediate
+-    wire [31:0] Imm32;       // 32-bit immediate
+-    wire [19:0] IMM;         // 20-bit immediate (address)
+-    wire [4:0]  A3;          // register address for write
+-    reg  [31:0] WD;          // register write data
+-    wire [31:0] RD1,RD2;     // register data specified by rs
+-    wire [31:0] B;           // operator for ALU B
+-	
+-	wire [4:0]  iimm_shamt;
+-	wire [11:0] iimm,simm,bimm;
+-	wire [19:0] uimm,jimm;
+-	wire [31:0] immout;
++    input  [4:0]  reg_sel,     // 调试用寄存器选择
++    output [31:0] reg_data     // 调试用寄存器输出
++);
++
++    // ---- 控制信号 ----
++    wire        RegWrite;
++    wire [5:0]  EXTOp;
++    wire [4:0]  ALUOp;
++    wire [2:0]  NPCOp;
++    wire [1:0]  WDSel;
++    wire        ALUSrc;
++    wire        Zero;
++
++    // ---- 数据通路信号 ----
++    wire [31:0] NPC;
++    wire [4:0]  rs1, rs2, rd;
++    wire [6:0]  Op, Funct7;
++    wire [2:0]  Funct3;
++    wire [31:0] immout;
++    wire [31:0] RD1, RD2;
++    wire [31:0] B;
+     wire [31:0] aluout;
+-    
+-    assign Addr_out=aluout;
+-	assign B = (ALUSrc) ? immout : RD2;
+-	assign Data_out = RD2;
+-	
+-	assign iimm=inst_in[31:20];
+-	assign simm={inst_in[31:25],inst_in[11:7]};
+-	assign uimm=inst_in[31:12];
+-	assign bimm={inst_in[31],inst_in[7],inst_in[30:25],inst_in[11:8]};
+-	assign jimm={inst_in[31],inst_in[19:12],inst_in[20],inst_in[30:21]};
++    reg  [31:0] WD;
+ 
+-    assign Op = inst_in[6:0];  // instruction
+-    assign Funct7 = inst_in[31:25]; // funct7
+-    assign Funct3 = inst_in[14:12]; // funct3
+-    assign rs1 = inst_in[19:15];  // rs1
+-    assign rs2 = inst_in[24:20];  // rs2
+-    assign rd = inst_in[11:7];  // rd
+-    assign Imm12 = inst_in[31:20];// 12-bit immediate
+-    assign IMM = inst_in[31:12];  // 20-bit immediate
+-   
+-   // instantiation of control unit
+-	ctrl U_ctrl(
+-		.Op(Op), .Funct7(Funct7), .Funct3(Funct3), .Zero(Zero), 
+-		.RegWrite(RegWrite), .MemWrite(mem_w),
+-		.EXTOp(EXTOp), .ALUOp(ALUOp), .NPCOp(NPCOp), 
+-		.ALUSrc(ALUSrc), .WDSel(WDSel)
+-	);
+- // instantiation of pc unit
+-	PC  U_PC(.clk(clk), .rst(reset), .NPC(NPC), .PC(PC_out) );
+-	NPC U_NPC(.PC(PC_out), .NPCOp(NPCOp), .IMM(immout), .NPC(NPC));
+-	EXT U_EXT(
+-		.iimm(iimm), .simm(simm), .bimm(bimm), .uimm(uimm), .jimm(jimm),
+-		.EXTOp(EXTOp), .immout(immout)
+-	);
+-	RF U_RF(
+-		.clk(clk), .rst(reset),
+-		.RFWr(RegWrite), 
+-		.A1(rs1), .A2(rs2), .A3(rd), 
+-		.WD(WD), 
+-		.RD1(RD1), .RD2(RD2),
+-		.reg_sel(reg_sel),
+-		.reg_data(reg_data)
+-	);
+-// instantiation of alu unit
+-	alu U_alu(.A(RD1), .B(B), .ALUOp(ALUOp), .C(aluout), .Zero(Zero));
++    // ---- 立即数分解 ----
++    wire [11:0] iimm, simm, bimm;
++    wire [19:0] uimm, jimm;
+ 
+-//please connnect the CPU by yourself
+-always @*
+-begin
+-	case(WDSel)
+-		`WDSel_FromALU: WD<=aluout;
+-		`WDSel_FromMEM: WD<=Data_in;
+-        `WDSel_FromPC:  WD<=PC_out+4;
+-        default: WD<=aluout;
+-	endcase
+-end
++    assign iimm = inst_in[31:20];
++    assign simm = {inst_in[31:25], inst_in[11:7]};
++    assign bimm = {inst_in[31], inst_in[7], inst_in[30:25], inst_in[11:8]};
++    assign uimm = inst_in[31:12];
++    assign jimm = {inst_in[31], inst_in[19:12], inst_in[20], inst_in[30:21]};
+ 
++    // ---- 指令字段 ----
++    assign Op     = inst_in[6:0];
++    assign Funct7 = inst_in[31:25];
++    assign Funct3 = inst_in[14:12];
++    assign rs1    = inst_in[19:15];
++    assign rs2    = inst_in[24:20];
++    assign rd     = inst_in[11:7];
++
++    // ---- ALU B 源选择 ----
++    assign B        = ALUSrc ? immout : RD2;
++    assign Addr_out = aluout;
++    assign Data_out = RD2;
++
++    // ---- 子模块例化 ----
++    ctrl U_ctrl(
++        .Op(Op), .Funct7(Funct7), .Funct3(Funct3), .Zero(Zero),
++        .RegWrite(RegWrite), .MemWrite(mem_w),
++        .EXTOp(EXTOp), .ALUOp(ALUOp), .NPCOp(NPCOp),
++        .ALUSrc(ALUSrc), .WDSel(WDSel)
++    );
++
++    PC U_PC(
++        .clk(clk), .rst(reset), .NPC(NPC), .PC(PC_out)
++    );
++
++    NPC U_NPC(
++        .PC(PC_out), .NPCOp(NPCOp), .IMM(immout), .RS1(RD1), .NPC(NPC)
++    );
++
++    EXT U_EXT(
++        .iimm(iimm), .simm(simm), .bimm(bimm), .uimm(uimm), .jimm(jimm),
++        .EXTOp(EXTOp), .immout(immout)
++    );
++
++    RF U_RF(
++        .clk(clk), .rst(reset),
++        .RFWr(RegWrite),
++        .A1(rs1), .A2(rs2), .A3(rd),
++        .WD(WD),
++        .RD1(RD1), .RD2(RD2),
++        .reg_sel(reg_sel), .reg_data(reg_data)
++    );
++
++    alu U_alu(
++        .A(RD1), .B(B), .ALUOp(ALUOp), .C(aluout), .Zero(Zero)
++    );
++
++    // ---- 写回数据选择 ----
++    always @(*) begin
++        case (WDSel)
++            `WDSel_FromALU: WD = aluout;
++            `WDSel_FromMEM: WD = Data_in;
++            `WDSel_FromPC:  WD = PC_out + 4;  // jal/jalr：返回地址 = 当前 PC + 4
++            default:        WD = aluout;
++        endcase
++    end
++
+ endmodule
+
+--- a/pipeline/alu.v
++++ b/pipeline/alu.v
+@@ -1,30 +1,48 @@
++// ============================================================
++//  alu.v  —  流水线 RISC-V CPU 算术逻辑单元（Final 扩展版）
++//  作者：占锦翔
++//  说明：与单周期 alu.v 相同逻辑，Zero 语义统一为"条件成立=1"
++// ============================================================
+ `include "ctrl_encode_def.v"
+ 
+-module alu(A, B, ALUOp, C, Zero);
+-   input  signed [31:0] A, B;
+-   input         [4:0]  ALUOp;
+-   output signed [31:0] C;
+-   output Zero;  //condition flag: set if condition is true for B-type instruction
+-   
+-   reg [31:0] C;
+-   integer    i;
+-       
+-   always @( * ) begin
+-      case ( ALUOp )
+-        `ALUOp_lui:C=B;
+-        `ALUOp_add:C=A+B;
+-        `ALUOp_sub:C=A-B;  //and beq
+-        `ALUOp_xor:C=A^B;
+-        `ALUOp_or:C=A|B;
+-        `ALUOp_and:C=A&B;
+-        `ALUOp_sll:C=A<<B;
+-        `ALUOp_srl:C=A>>B;
+-        `ALUOp_sra:C=A>>>B;
+-        default: C=A;
+-      endcase
+-   end 
+-   
+-   assign Zero = (C == 32'b0);  
++module alu(
++    input  signed [31:0] A,
++    input  signed [31:0] B,
++    input         [4:0]  ALUOp,
++    output signed [31:0] C,
++    output               Zero
++);
+ 
++    reg [31:0] C;
++
++    always @(*) begin
++        case (ALUOp)
++            `ALUOp_lui:  C = B;
++            `ALUOp_add:  C = A + B;
++            `ALUOp_sub:  C = A - B;
++            `ALUOp_bne:  C = (A != B)                   ? 32'd1 : 32'd0;
++            `ALUOp_blt:  C = ($signed(A) < $signed(B))  ? 32'd1 : 32'd0;
++            `ALUOp_bge:  C = ($signed(A) >= $signed(B)) ? 32'd1 : 32'd0;
++            `ALUOp_bltu: C = ($unsigned(A) < $unsigned(B))  ? 32'd1 : 32'd0;
++            `ALUOp_bgeu: C = ($unsigned(A) >= $unsigned(B)) ? 32'd1 : 32'd0;
++            `ALUOp_slt:  C = ($signed(A) < $signed(B))     ? 32'd1 : 32'd0;
++            `ALUOp_sltu: C = ($unsigned(A) < $unsigned(B)) ? 32'd1 : 32'd0;
++            `ALUOp_xor:  C = A ^ B;
++            `ALUOp_or:   C = A | B;
++            `ALUOp_and:  C = A & B;
++            `ALUOp_sll:  C = A << B[4:0];
++            `ALUOp_srl:  C = $unsigned(A) >> B[4:0];
++            `ALUOp_sra:  C = $signed(A)   >>> B[4:0];
++            default:     C = A;
++        endcase
++    end
++
++    // Zero：B-type 比较指令 C!=0 即条件成立；其余 C==0 为零标志
++    assign Zero = (ALUOp == `ALUOp_bne  ||
++                   ALUOp == `ALUOp_blt  ||
++                   ALUOp == `ALUOp_bge  ||
++                   ALUOp == `ALUOp_bltu ||
++                   ALUOp == `ALUOp_bgeu) ? (C != 32'b0)
++                                         : (C == 32'b0);
++
+ endmodule
+-    
+
+--- a/pipeline/ctrl.v
++++ b/pipeline/ctrl.v
+@@ -1,99 +1,190 @@
+- `include "ctrl_encode_def.v"
++// ============================================================
++//  ctrl.v  —  流水线 RISC-V CPU 控制器（Final 扩展版）
++//  作者：占锦翔
++//  说明：在 CODExp demo 基础上扩展，支持所有 Final 要求指令：
++//        beq, bne, blt, bge, bltu, bgeu
++//        slt, sltu, andi, ori, xori
++//        srli, srai, slli
++//        slti, sltiu
++//        jal, jalr
++//  注意：NPCOp 使用 5 位（[4:1] 操作类型 + [0] 条件），
++//        jalr 需要 EX 阶段拿到 rs1 后才能计算目标地址，
++//        控制冒险由 PLCPU 的冲刷逻辑处理。
++// ============================================================
++`include "ctrl_encode_def.v"
+ 
+-module ctrl(Op, Funct7, Funct3, Zero, 
+-            RegWrite, MemWrite, MemRead,
+-            EXTOp, ALUOp, NPCOp, 
+-            ALUSrc, WDSel
+-            );
+-            
+-   input  [6:0] Op;       // opcode
+-   input  [6:0] Funct7;    // funct7
+-   input  [2:0] Funct3;    // funct3
+-   input        Zero;
+-   
+-   output       RegWrite; // control signal for register write
+-   output       MemWrite; // control signal for memory write
+-   output       MemRead;  // control signal for memory read
+-   output [5:0] EXTOp;    // control signal to signed extension
+-   output [4:0] ALUOp;    // ALU opertion
+-   output [4:0] NPCOp;    // next pc operation
+-   output       ALUSrc;   // ALU source for B
+-   output [1:0] WDSel;    // (register) write data selection
+-   
+-   //LUI
+-   wire LUI = ~Op[6]&Op[5]&Op[4]&~Op[3]&Op[2]&Op[1]&Op[0];
++module ctrl(
++    input  [6:0] Op,
++    input  [6:0] Funct7,
++    input  [2:0] Funct3,
++    input        Zero,        // 来自 EX 阶段 ALU（由 PLCPU 通过 EX_NPCOp[0]&Zero 逻辑使用）
+ 
+-  // r format 0110011
+-    wire rtype  = ~Op[6]&Op[5]&Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0110011
+-    wire i_add  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]&~Funct3[2]&~Funct3[1]&~Funct3[0]; // add 0000000 000
+-    wire i_sub  = rtype& ~Funct7[6]& Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]&~Funct3[2]&~Funct3[1]&~Funct3[0]; // sub 0100000 000
+-    wire i_or   = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]& Funct3[1]&~Funct3[0]; // or 0000000 110
+-    wire i_and  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]& Funct3[1]& Funct3[0]; // and 0000000 111
+-    wire i_xor  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]&~Funct3[1]&~Funct3[0]; // xor 0000000 100
+-    wire i_sll  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]&~Funct3[2]&~Funct3[1]& Funct3[0]; // sll 0000000 001
+-    wire i_srl  = rtype& ~Funct7[6]&~Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]&~Funct3[1]& Funct3[0]; // srl 0000000 101
+-    wire i_sra  = rtype& ~Funct7[6]& Funct7[5]&~Funct7[4]&~Funct7[3]&~Funct7[2]&~Funct7[1]&~Funct7[0]& Funct3[2]&~Funct3[1]& Funct3[0]; // sra 0100000 101
++    output reg       RegWrite,
++    output reg       MemWrite,
++    output reg       MemRead,
++    output reg [5:0] EXTOp,
++    output reg [4:0] ALUOp,
++    output reg [4:0] NPCOp,   // [4:1]=操作类型, [0]=是否为条件跳转（需与Zero配合）
++    output reg       ALUSrc,
++    output reg [1:0] WDSel
++);
+ 
+-  // i format load 0000011
+-    wire itype_l  = ~Op[6]&~Op[5]&~Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0000011
+-    wire i_lw = itype_l&~Funct3[2]& Funct3[1]&~Funct3[0];//lw 010   
+-    
+-  // i format 0010011
+-    wire itype_r  = ~Op[6]&~Op[5]&Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0]; //0010011
+-    wire i_addi  =  itype_r& ~Funct3[2]& ~Funct3[1]& ~Funct3[0]; // addi 000
++    always @(*) begin
++        // 默认 NOP
++        RegWrite = 1'b0;
++        MemWrite = 1'b0;
++        MemRead  = 1'b0;
++        EXTOp    = 6'b0;
++        ALUOp    = `ALUOp_nop;
++        NPCOp    = 5'b00000;   // 低位[0]=0表示非分支，高位[4:1]=0表示PC+4
++        ALUSrc   = 1'b0;
++        WDSel    = `WDSel_FromALU;
+ 
+-  // s format 0100011
+-    wire stype  = ~Op[6]&Op[5]&~Op[4]&~Op[3]&~Op[2]&Op[1]&Op[0];//0100011
+-    wire i_sw   =  stype& ~Funct3[2]& Funct3[1]&~Funct3[0]; // sw 010
+-    
+-  // generate control signals
+-  assign RegWrite   = rtype | itype_r | LUI | itype_l; // register write
+-  assign MemWrite   = stype;                // memory write
+-  assign MemRead    = itype_l;              // memory read
+-  assign ALUSrc     = itype_r | stype | LUI | itype_l;   // ALU B is from instruction immediate
++        case (Op)
++        //----------------------------------------------------
++        // LUI: U-type
++        //----------------------------------------------------
++        7'b0110111: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_UTYPE;
++            ALUOp    = `ALUOp_lui;
++        end
+ 
+-  // signed extension
+-  // EXT_CTRL_ITYPE_SHAMT 6'b100000
+-  // EXT_CTRL_ITYPE	      6'b010000
+-  // EXT_CTRL_STYPE	      6'b001000
+-  // EXT_CTRL_BTYPE	      6'b000100
+-  // EXT_CTRL_UTYPE	      6'b000010
+-  // EXT_CTRL_JTYPE	      6'b000001
+-  assign EXTOp[5]    = 0;
+-  assign EXTOp[4]    = i_addi | itype_l;
+-  assign EXTOp[3]    = stype; 
+-  assign EXTOp[2]    = 0; 
+-  assign EXTOp[1]    = LUI;
+-  assign EXTOp[0]    = 0;         
+-    
+-  // WDSel_FromALU 2'b00
+-  // WDSel_FromMEM 2'b01
+-  // WDSel_FromPC  2'b10 
+-    assign WDSel[1] = 0;
+-    assign WDSel[0] = itype_l;
++        //----------------------------------------------------
++        // R-type: 0110011
++        //----------------------------------------------------
++        7'b0110011: begin
++            RegWrite = 1'b1;
++            case ({Funct7, Funct3})
++                {7'b0000000, 3'b000}: ALUOp = `ALUOp_add;
++                {7'b0100000, 3'b000}: ALUOp = `ALUOp_sub;
++                {7'b0000000, 3'b010}: ALUOp = `ALUOp_slt;
++                {7'b0000000, 3'b011}: ALUOp = `ALUOp_sltu;
++                {7'b0000000, 3'b100}: ALUOp = `ALUOp_xor;
++                {7'b0000000, 3'b110}: ALUOp = `ALUOp_or;
++                {7'b0000000, 3'b111}: ALUOp = `ALUOp_and;
++                {7'b0000000, 3'b001}: ALUOp = `ALUOp_sll;
++                {7'b0000000, 3'b101}: ALUOp = `ALUOp_srl;
++                {7'b0100000, 3'b101}: ALUOp = `ALUOp_sra;
++                default: begin
++                    RegWrite = 1'b0;
++                    ALUOp    = `ALUOp_nop;
++                end
++            endcase
++        end
+ 
+-// NPC_PLUS4      5'b00000
+-// NPC_BRANCH     5'b00001
+-// NPC_JUMP       5'b00010
+-// NPC_JALR       5'b00100
+-    assign NPCOp[2] = 0;
+-    assign NPCOp[1] = 0;
+-    assign NPCOp[0] = 0;
++        //----------------------------------------------------
++        // I-type arithmetic: 0010011
++        //----------------------------------------------------
++        7'b0010011: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_ITYPE;
++            case (Funct3)
++                3'b000: ALUOp = `ALUOp_add;   // addi
++                3'b010: ALUOp = `ALUOp_slt;   // slti
++                3'b011: ALUOp = `ALUOp_sltu;  // sltiu
++                3'b100: ALUOp = `ALUOp_xor;   // xori
++                3'b110: ALUOp = `ALUOp_or;    // ori
++                3'b111: ALUOp = `ALUOp_and;   // andi
++                3'b001: ALUOp = (Funct7 == 7'b0000000) ? `ALUOp_sll : `ALUOp_nop; // slli
++                3'b101: ALUOp = (Funct7 == 7'b0100000) ? `ALUOp_sra : `ALUOp_srl; // srai/srli
++                default: begin
++                    RegWrite = 1'b0;
++                    ALUOp    = `ALUOp_nop;
++                end
++            endcase
++        end
+ 
+-// ALUOp_nop 5'b00000
+-// ALUOp_lui 5'b00001
+-// ALUOp_add 5'b00011
+-// ALUOp_sub 5'b00100
+-// ALUOp_xor 5'b01100
+-// ALUOp_or 5'b01101
+-// ALUOp_and 5'b01110
+-// ALUOp_sll 5'b01111
+-// ALUOp_srl 5'b10000
+-// ALUOp_sra 5'b10001
+-    assign ALUOp[4] = i_srl | i_sra;
+-    assign ALUOp[3] = i_and | i_or | i_sll | i_xor;
+-    assign ALUOp[2] = i_and | i_or | i_sub | i_sll | i_xor;
+-    assign ALUOp[1] = i_addi | i_add | i_and | i_sll | itype_l | stype ;
+-	  assign ALUOp[0] = i_addi | i_add | i_or | LUI | i_sll | i_sra | itype_l | stype ;
+-	
++        //----------------------------------------------------
++        // I-type load: 0000011
++        //----------------------------------------------------
++        7'b0000011: begin
++            RegWrite = 1'b1;
++            MemRead  = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_ITYPE;
++            ALUOp    = `ALUOp_add;
++            WDSel    = `WDSel_FromMEM;
++        end
++
++        //----------------------------------------------------
++        // S-type: 0100011
++        //----------------------------------------------------
++        7'b0100011: begin
++            MemWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_STYPE;
++            ALUOp    = `ALUOp_add;
++        end
++
++        //----------------------------------------------------
++        // B-type: 1100011
++        // NPCOp[4:1] 编码分支类型，[0] 固定为1表示"有条件"
++        // EX 阶段：EX_NPCOp = {NPCOp[4:1], NPCOp[0] & Zero}
++        //----------------------------------------------------
++        7'b1100011: begin
++            EXTOp = `EXT_CTRL_BTYPE;
++            case (Funct3)
++                3'b000: begin // beq: sub, Zero=(C==0)
++                    ALUOp = `ALUOp_sub;
++                    NPCOp = {4'b0000, 1'b1}; // [0]=1 表示条件跳转，结合 Zero
++                end
++                3'b001: begin // bne
++                    ALUOp = `ALUOp_bne;
++                    NPCOp = {4'b0001, 1'b1};
++                end
++                3'b100: begin // blt
++                    ALUOp = `ALUOp_blt;
++                    NPCOp = {4'b0010, 1'b1};
++                end
++                3'b101: begin // bge
++                    ALUOp = `ALUOp_bge;
++                    NPCOp = {4'b0011, 1'b1};
++                end
++                3'b110: begin // bltu
++                    ALUOp = `ALUOp_bltu;
++                    NPCOp = {4'b0100, 1'b1};
++                end
++                3'b111: begin // bgeu
++                    ALUOp = `ALUOp_bgeu;
++                    NPCOp = {4'b0101, 1'b1};
++                end
++                default: begin
++                    ALUOp = `ALUOp_nop;
++                    NPCOp = 5'b00000;
++                end
++            endcase
++        end
++
++        //----------------------------------------------------
++        // JAL: 1101111
++        //----------------------------------------------------
++        7'b1101111: begin
++            RegWrite = 1'b1;
++            EXTOp    = `EXT_CTRL_JTYPE;
++            NPCOp    = {4'b1000, 1'b1}; // 无条件跳转，高位编码 JAL
++            WDSel    = `WDSel_FromPC;
++        end
++
++        //----------------------------------------------------
++        // JALR: 1100111
++        // 需要 EX 阶段拿到 rs1 才能计算目标，控制冒险在 PLCPU 处理
++        //----------------------------------------------------
++        7'b1100111: begin
++            RegWrite = 1'b1;
++            ALUSrc   = 1'b1;
++            EXTOp    = `EXT_CTRL_ITYPE;
++            ALUOp    = `ALUOp_add;
++            NPCOp    = {4'b1001, 1'b1}; // 无条件跳转，高位编码 JALR
++            WDSel    = `WDSel_FromPC;
++        end
++
++        default: begin
++            RegWrite = 1'b0;
++            MemWrite = 1'b0;
++        end
++        endcase
++    end
+ endmodule
+
+--- a/pipeline/ctrl_encode_def.v
++++ b/pipeline/ctrl_encode_def.v
+@@ -1,54 +1,51 @@
+-`timescale 1ns/1ps
+-
+-// NPC control signal
+-`define NPC_PLUS4   5'b00000
+-`define NPC_BRANCH  5'b00001
+-`define NPC_JUMP    5'b00010
+-`define NPC_JALR 5'b00100
+-`define NPC_SEPC 5'b01000
+-`define NPC_SEPC_PLUS4 5'b10000
++// ============================================================
++//  ctrl_encode_def.v  —  流水线 CPU 使用的宏定义（Final 版）
++//  与单周期版本完全一致，统一引用
++// ============================================================
++`timescale 1ns/1ns
+ 
+-// ALU control signal
+-`define ALU_NOP   3'b000 
+-`define ALU_ADD   3'b001
+-`define ALU_SUB   3'b010 
+-`define ALU_AND   3'b011
+-`define ALU_OR    3'b100
++// NPC 控制信号（单周期用 3 位，流水线 ctrl.v 输出 5 位，含条件位）
++`define NPC_PLUS4   3'b000
++`define NPC_BRANCH  3'b001
++`define NPC_JUMP    3'b010
++`define NPC_JALR    3'b100
+ 
+-//EXT CTRL itype, stype, btype, utype, jtype
++// EXT CTRL
+ `define EXT_CTRL_ITYPE_SHAMT 6'b100000
+-`define EXT_CTRL_ITYPE	6'b010000
+-`define EXT_CTRL_STYPE	6'b001000
+-`define EXT_CTRL_BTYPE	6'b000100
+-`define EXT_CTRL_UTYPE	6'b000010
+-`define EXT_CTRL_JTYPE	6'b000001
++`define EXT_CTRL_ITYPE  6'b010000
++`define EXT_CTRL_STYPE  6'b001000
++`define EXT_CTRL_BTYPE  6'b000100
++`define EXT_CTRL_UTYPE  6'b000010
++`define EXT_CTRL_JTYPE  6'b000001
+ 
++// 寄存器写回数据选择
+ `define WDSel_FromALU 2'b00
+ `define WDSel_FromMEM 2'b01
+-`define WDSel_FromPC 2'b10
++`define WDSel_FromPC  2'b10
+ 
+-`define ALUOp_nop 5'b00000
+-`define ALUOp_lui 5'b00001
++// ALUOp 编码
++`define ALUOp_nop   5'b00000
++`define ALUOp_lui   5'b00001
+ `define ALUOp_auipc 5'b00010
+-`define ALUOp_add 5'b00011
+-`define ALUOp_sub 5'b00100
+-`define ALUOp_bne 5'b00101
+-`define ALUOp_blt 5'b00110
+-`define ALUOp_bge 5'b00111
+-`define ALUOp_bltu 5'b01000
+-`define ALUOp_bgeu 5'b01001
+-`define ALUOp_slt 5'b01010
+-`define ALUOp_sltu 5'b01011
+-`define ALUOp_xor 5'b01100
+-`define ALUOp_or 5'b01101
+-`define ALUOp_and 5'b01110
+-`define ALUOp_sll 5'b01111
+-`define ALUOp_srl 5'b10000
+-`define ALUOp_sra 5'b10001
++`define ALUOp_add   5'b00011
++`define ALUOp_sub   5'b00100
++`define ALUOp_bne   5'b00101
++`define ALUOp_blt   5'b00110
++`define ALUOp_bge   5'b00111
++`define ALUOp_bltu  5'b01000
++`define ALUOp_bgeu  5'b01001
++`define ALUOp_slt   5'b01010
++`define ALUOp_sltu  5'b01011
++`define ALUOp_xor   5'b01100
++`define ALUOp_or    5'b01101
++`define ALUOp_and   5'b01110
++`define ALUOp_sll   5'b01111
++`define ALUOp_srl   5'b10000
++`define ALUOp_sra   5'b10001
+ 
+-`define dm_word 3'b000
+-`define dm_halfword 3'b001
++// 数据存储器访问类型
++`define dm_word              3'b000
++`define dm_halfword          3'b001
+ `define dm_halfword_unsigned 3'b010
+-`define dm_byte 3'b011
+-`define dm_byte_unsigned 3'b100
+-
++`define dm_byte              3'b011
++`define dm_byte_unsigned     3'b100
+
+--- a/pipeline/dm.v
++++ b/pipeline/dm.v
+@@ -1,25 +1,22 @@
+-// data memory
+ `include "ctrl_encode_def.v"
++// data memory (pipeline version with DMRe)
+ module dm(clk, DMWr, DMRe, addr, din, dout);
+    input          clk;
+    input          DMWr;
+    input          DMRe;
+    input  [31:0]  addr;
+    input  [31:0]  din;
+    output reg [31:0]  dout;
+    
+    reg [31:0] dmem[127:0];
+    
+    always @(posedge clk)
+       if (DMWr) begin
+-          dmem[addr[8:2]] <= din;
+-          $write(" memaddr = %h, memdata = %h \n", addr[31:0], din);
++         dmem[addr[8:2]] <= din;
+       end
+    
+-   //load
+    always @(*)
+       if (DMRe) begin
+          dout <= dmem[addr[8:2]];
+       end
+-   
+-endmodule    
++endmodule
+
+--- a/pipeline/EXT.v
++++ b/pipeline/EXT.v
+@@ -1,19 +1,22 @@
+ `include "ctrl_encode_def.v"
+ module EXT( 
+-    input	[11:0]			iimm, //instr[31:20], 12 bits
+-	input	[11:0]			simm, //instr[31:25, 11:7], 12 bits
+-	input	[19:0]			uimm, // U type
+-	input	[5:0]			EXTOp,
+-
+-	output	reg [31:0] 	    immout
+-	);
++    input   [11:0]  iimm,
++    input   [11:0]  simm,
++    input   [11:0]  bimm,
++    input   [19:0]  uimm,
++    input   [19:0]  jimm,
++    input   [5:0]   EXTOp,
++    output  reg [31:0]  immout
++);
+ 
+ always  @(*)
+-	 case (EXTOp)
+-		`EXT_CTRL_ITYPE:	immout <= {{20{iimm[11]}}, iimm[11:0]};
+-		`EXT_CTRL_STYPE:	immout <= {{20{simm[11]}}, simm[11:0]};
+-		`EXT_CTRL_UTYPE:	immout <= {uimm[19:0], 12'b0};     //???????????12??0
+-		default:	        immout <= 32'b0;
+-	 endcase
++    case (EXTOp)
++        `EXT_CTRL_ITYPE:  immout <= {{20{iimm[11]}}, iimm[11:0]};
++        `EXT_CTRL_STYPE:  immout <= {{20{simm[11]}}, simm[11:0]};
++        `EXT_CTRL_BTYPE:  immout <= {{19{bimm[11]}}, bimm[11:0], 1'b0};
++        `EXT_CTRL_UTYPE:  immout <= {uimm[19:0], 12'b0};
++        `EXT_CTRL_JTYPE:  immout <= {{21{jimm[19]}}, jimm[19:0], 1'b0};
++        default:          immout <= 32'b0;
++    endcase
+        
+ endmodule
+
+--- a/pipeline/im.v
++++ b/pipeline/im.v
+@@ -1,6 +1,6 @@
+ // instruction memory
+-module im(input  [31:2]  addr, output [31:0] dout );
+-  reg  [31:0] RAM[255:0];
++module im(input  [31:2]  addr, output [31:0] dout);
++  reg  [31:0] RAM[127:0];
+ 
+   assign dout = RAM[addr]; // word aligned
+-endmodule  
++endmodule
+
+--- a/pipeline/NPC.v
++++ b/pipeline/NPC.v
+@@ -1,20 +1,23 @@
+ `include "ctrl_encode_def.v"
+ 
+-module NPC(PC, NPCOp, IMM, NPC);  // next pc module
++module NPC( PC, NPCOp, IMM, RS1, NPC );  // next pc module
+    input  [31:0] PC;        // pc
+-   input  [4:0]  NPCOp;     // next pc operation
++   input  [2:0]  NPCOp;     // next pc operation
+    input  [31:0] IMM;       // immediate
++   input  [31:0] RS1;       // rs1 data for jalr
+    output reg [31:0] NPC;   // next pc
+    
+    wire [31:0] PCPLUS4;
+    assign PCPLUS4 = PC + 4; // pc + 4
+-  
++   
+    always @(*) begin
+-        case (NPCOp)
+-            `NPC_PLUS4:  NPC = PCPLUS4;
+-  
+-            default:     NPC = PCPLUS4;
+-        endcase
+-    end // end always
++      case (NPCOp)
++          `NPC_PLUS4:  NPC = PCPLUS4;   // NPC computes addr
++          `NPC_BRANCH: NPC = PC+IMM;    //B type, NPC computes addr
++          `NPC_JUMP:   NPC = PC+IMM;    //J type, NPC computes addr
++          `NPC_JALR:   NPC = (RS1 + IMM) & 32'hffff_fffe;
++          default:     NPC = PCPLUS4;
++      endcase
++   end 
+    
+ endmodule
+
+--- a/pipeline/PC.v
++++ b/pipeline/PC.v
+@@ -1,20 +1,14 @@
+ module PC( clk, rst, NPC, PC );
+   input              clk;
+   input              rst;
+   input       [31:0] NPC;
+   output reg  [31:0] PC;
+-
+-  always @(posedge clk, posedge rst) begin
+-    if (rst) begin
+-       PC <= 32'h0000_0000;
+-       //$write("\n reset pc = %h: ", PC);
+-       end
+-    else 
+-       begin 
+-         PC <= NPC; 
+-         //$write("\n pc = %h: ", PC);
+-       end
+-  end
+-  
+-endmodule
++ 
++   always @(posedge clk, posedge rst) begin
++     if (rst) 
++        PC <= 32'h0000_0000;
++     else 
++        PC <= NPC;
++   end 
++ endmodule
+ 
+
+--- a/pipeline/pl_reg.v
++++ b/pipeline/pl_reg.v
+@@ -1,15 +0,0 @@
+-module pl_reg #(parameter WIDTH = 32)(
+-    input clk, rst, 
+-    input [WIDTH-1:0] in,
+-    output reg [WIDTH-1:0] out
+-    );
+-    
+-    always@(posedge clk, posedge rst)
+-      begin
+-          if(rst)
+-              out <= 0;
+-          else 
+-              out <= in;
+-      end
+-    
+-endmodule
+
+--- a/pipeline/plcomp.v
++++ b/pipeline/plcomp.v
+@@ -1,65 +1,40 @@
+ `include "ctrl_encode_def.v"
+ module plcomp(clk, rstn);
+   input             clk, rstn;
+    
+    wire [31:0]    instr;
+    wire [31:0]    PC;
+    wire           MemWrite;
+    wire           MemRead;
+    wire [31:0]    dm_addr, dm_din, dm_dout;
+    wire [2:0] DMType;
+    
+    wire reset;
+    assign reset = rstn;
+    
+-   // instantiation of pipeline CPU   
+    PLCPU U_PLCPU(
+-         .clk(clk),                 // input:  cpu clock
+-         .reset(reset),                 // input:  reset
+-         .inst_in(instr),             // input:  instruction from im
+-         .Data_in(dm_dout),        // input:  data to cpu  
+-         .mem_w(MemWrite),       // output: memory write signal
+-         .mem_r(MemRead),       // output: memory read signal
+-         .PC_out(PC),                   // output: PC to im
+-         .Addr_out(dm_addr),          // output: address from cpu to memory
+-         .Data_out(dm_din)        // output: data from cpu to memory
++         .clk(clk),
++         .reset(reset),
++         .inst_in(instr),
++         .Data_in(dm_dout),
++         .mem_w(MemWrite),
++         .mem_r(MemRead),
++         .PC_out(PC),
++         .Addr_out(dm_addr),
++         .Data_out(dm_din)
+          );
+    
+    dm  U_DM(
+-         .clk(clk),           // input:  cpu clock
+-         .DMWr(MemWrite),     // input:  ram write
+-         .DMRe(MemRead),      // input:  ram read
+-         .addr(dm_addr),      // input:  ram address
+-         .din(dm_din),         // input:  data to ram
+-         .dout(dm_dout)       // output: data from ram
++         .clk(clk),
++         .DMWr(MemWrite),
++         .DMRe(MemRead),
++         .addr(dm_addr),
++         .din(dm_din),
++         .dout(dm_dout)
+          );
+          
+-  // instantiation of intruction memory (used for simulation)
+    im    U_imem ( 
+-      .addr(PC[31:2]),     // input:  rom address
+-      .dout(instr)        // output: instruction
++      .addr(PC[31:2]),
++      .dout(instr)
+    );
+-   
+-  
+ endmodule
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+
+--- a/pipeline/plcomp_tb.v
++++ b/pipeline/plcomp_tb.v
+@@ -1,28 +0,0 @@
+-`timescale 1ns/1ns 
+-module plcomp_tb();
+-  reg   clk, rstn;
+-  integer i=0;  //for debug
+-
+-  // instantiation of plcomp
+-  plcomp plcomp(clk, rstn);
+-  
+-  initial begin
+-    // input instructions for simulation
+-    $readmemh("rv32_pl_sim.dat", plcomp.U_imem.RAM); //( 21 ins-25cycles )
+-    clk = 0;
+-    rstn = 1;
+-    #50 ;
+-    rstn = 0;
+-  end
+-  
+-  always begin
+-    #(5) clk = ~clk;
+-  end
+-
+-  always @(posedge clk) begin   //for debug
+-       i=i+1;
+-       if (clk) $write("\n cycle=%d, IF_PC=%h, IF_ins=%h, ", i, plcomp.PC, plcomp.instr );
+-       if (plcomp.U_PLCPU.U_RF.RFWr && plcomp.U_PLCPU.U_RF.A3) $write("x%d = %h  ", plcomp.U_PLCPU.U_RF.A3, plcomp.U_PLCPU.U_RF.WD) ;
+-  end
+-      
+-endmodule
+
+--- a/pipeline/PLCPU.v
++++ b/pipeline/PLCPU.v
+@@ -1,277 +1,417 @@
++// ============================================================
++//  PLCPU.v  —  五级流水线 RISC-V CPU 顶层（Final 扩展版）
++//  作者：占锦翔
++//  阶段：IF → ID → EX → MEM → WB
++//
++//  扩展内容（相对于 CODExp demo）：
++//  1. ctrl.v 支持所有 Final 指令（详见 ctrl.v 注释）
++//  2. alu.v 支持 slt/sltu/xori/ori/andi/srli/srai/slli 等
++//  3. 数据前推（MEM→EX 和 WB→EX 两级 forwarding）
++//  4. Load-Use 阻塞（load 后紧跟使用，插入一个气泡）
++//  5. 控制冒险冲刷（B-type/jal/jalr 跳转时冲刷 IF+ID 寄存器）
++//  6. JALR 支持：EX 阶段用 rs1+imm 计算目标并冲刷
++//
++//  流水线寄存器宽度说明：
++//    IF/ID  : [31:0]PC + [31:0]instr = 64 位
++//    ID/EX  : 200 位（详见 assign 段）
++//    EX/MEM : 146 位
++//    MEM/WB : 136 位
++// ============================================================
+ `include "ctrl_encode_def.v"
++
+ module PLCPU(
+-    input      clk,            // clock
+-    input      reset,          // reset
+-    input [31:0]  inst_in,     // instruction
+-    input [31:0]  Data_in,     // data from data memory
+-    output [31:0] PC_out,     // PC address
+-    output [31:0] Addr_out,   // ALU output
+-    output [31:0] Data_out,   // data to data memory
+-    output    mem_w,          // output: memory write signal
+-    output    mem_r           // output: memory read signal
++    input         clk,
++    input         reset,
++    input  [31:0] inst_in,   // 来自指令存储器（IF 阶段）
++    input  [31:0] Data_in,   // 来自数据存储器（MEM 阶段）
++    output [31:0] PC_out,    // 当前 PC（指令存储器地址）
++    output [31:0] Addr_out,  // 数据存储器地址（MEM_aluout）
++    output [31:0] Data_out,  // 写入数据存储器的数据
++    output        mem_w,     // 数据存储器写使能
++    output        mem_r      // 数据存储器读使能
+ );
+-    wire        RegWrite;    // control signal to register write
+-    wire [5:0]  EXTOp;      // control signal to signed extension
+-    wire [4:0]  ALUOp;       // ALU opertion
+-    wire [4:0]  NPCOp;       // next PC operation
+-    wire [1:0]  WDSel;       // (register) write data selection
+-   
+-    wire        ALUSrc;      // ALU source for B
+-    wire        Zero;        // ALU ouput zero
+ 
+-    wire [31:0] NPC;         // next PC
++// ─────────────────────────────────────────────────────────────
++//  一、ID 阶段信号（解码当前指令）
++// ─────────────────────────────────────────────────────────────
++    wire [31:0] instr;       // 从 IF/ID 寄存器取出的指令
++    wire [6:0]  Op     = instr[6:0];
++    wire [6:0]  Funct7 = instr[31:25];
++    wire [2:0]  Funct3 = instr[14:12];
++    wire [4:0]  rs1    = instr[19:15];
++    wire [4:0]  rs2    = instr[24:20];
++    wire [4:0]  rd     = instr[11:7];
+ 
+-    wire [4:0]  rs1;          // rs
+-    wire [4:0]  rs2;          // rt
+-    wire [4:0]  rd;          // rd
+-    wire [6:0]  Op;          // opcode
+-    wire [6:0]  Funct7;       // funct7
+-    wire [2:0]  Funct3;       // funct3
+-    wire [11:0] Imm12;       // 12-bit immediate
+-    wire [31:0] Imm32;       // 32-bit immediate
+-    wire [19:0] IMM;         // 20-bit immediate (address)
+-    wire [4:0]  A3;          // register address for write
+-    reg [31:0] WD;           // register write data
+-    reg [31:0] memdata_wr;    // memory write data
+-    wire [31:0] RD1,RD2;         // register data specified by rs
+-    wire [31:0] A;            //operator for ALU A
+-    wire [31:0] B;           // operator for ALU B
++    // 立即数分解
++    wire [11:0] iimm = instr[31:20];
++    wire [11:0] simm = {instr[31:25], instr[11:7]};
++    wire [11:0] bimm = {instr[31], instr[7], instr[30:25], instr[11:8]};
++    wire [19:0] uimm = instr[31:12];
++    wire [19:0] jimm = {instr[31], instr[19:12], instr[20], instr[30:21]};
+ 
+-	wire [4:0] iimm_shamt;
+-	wire [11:0] iimm,simm,bimm;
+-	wire [19:0] uimm,jimm;
+-	wire [31:0] immout;
+-	
+-	//EX wires
+-	wire [4:0] EX_rd;
+-    wire [4:0] EX_rs1;
+-    wire [4:0] EX_rs2;
+-    wire [31:0] EX_immout;
+-    wire [31:0] EX_RD1;
+-    wire [31:0] EX_RD2;
+-    wire        EX_RegWrite;//RFWr
+-    wire        EX_MemWrite;//DMWr
+-    wire        EX_MemRead;//DMRe
+-    wire [4:0] EX_ALUOp;
+-    wire [4:0] EX_NPCOp;
+-    wire       EX_ALUSrc;
+-    wire [1:0] EX_WDSel;
+-    wire [31:0] EX_pc;
+-	
+-	//MEM wires
+-	wire [4:0] MEM_rd;
+-	wire [4:0] MEM_rs2;
+-	wire [31:0] MEM_RD2;
+-	wire [31:0] MEM_aluout;
+-	wire        MEM_RegWrite;
+-	wire        MEM_MemWrite;
+-	wire        MEM_MemRead;
+-	wire [1:0] MEM_WDSel;
++    wire [31:0] immout;      // EXT 输出
++    wire [31:0] RD1, RD2;   // 寄存器堆读出
++    wire        Zero;        // ALU 条件标志
+ 
+-    assign mem_w = MEM_MemWrite;
+-    assign mem_r = MEM_MemRead;
+-    
+-    //WB wires
+-    wire [4:0] WB_rd;
+-    wire [31:0] WB_aluout;
+-    wire [31:0] WB_MemData;
++    // 控制信号（ID 阶段）
++    wire        RegWrite, ID_MemWrite, ID_MemRead;
++    wire [5:0]  EXTOp;
++    wire [4:0]  ALUOp, NPCOp;
++    wire        ALUSrc;
++    wire [1:0]  WDSel;
++
++    // WB 阶段写回信号
++    wire [4:0]  WB_rd;
++    wire [31:0] WB_aluout, WB_MemData;
+     wire        WB_RegWrite;
+     wire [1:0]  WB_WDSel;
+-	wire [31:0] WB_pc;
+-	
+-    wire[31:0] aluout;
++    wire [31:0] WB_pc;
++    reg  [31:0] WD;
++
++// ─────────────────────────────────────────────────────────────
++//  二、EX 阶段信号
++// ─────────────────────────────────────────────────────────────
++    wire [4:0]  EX_rd, EX_rs1, EX_rs2;
++    wire [31:0] EX_immout, EX_RD1, EX_RD2;
++    wire        EX_RegWrite, EX_MemWrite, EX_MemRead;
++    wire [4:0]  EX_ALUOp;
++    wire [4:0]  EX_NPCOp_raw;  // ID/EX 传入的 NPCOp（含条件位）
++    wire        EX_ALUSrc;
++    wire [1:0]  EX_WDSel;
++    wire [31:0] EX_pc;
++    wire [2:0]  EX_DMType;
++
++    // EX_NPCOp：[0] 与 Zero 做 AND 后确定是否实际跳转
++    // [4:1] 编码操作类型：
++    //   0000x = B-type beq（ALU sub, Zero=C==0）
++    //   0001x = bne, 0010x=blt, 0011x=bge, 0100x=bltu, 0101x=bgeu
++    //   1000x = JAL（无条件，Zero 无效——ctrl 未设置 ALUOp，默认 nop 使 Zero=0）
++    //   1001x = JALR（无条件，同上）
++    // FIX: JAL/JALR 不依赖 Zero，始终视作跳转
++    wire is_unconditional = (EX_NPCOp_raw[4:1] == 4'b1000) || (EX_NPCOp_raw[4:1] == 4'b1001);
++    wire [4:0] EX_NPCOp;
++    assign EX_NPCOp = {EX_NPCOp_raw[4:1],
++                       is_unconditional ? 1'b1 : (EX_NPCOp_raw[0] & Zero)};
++
++// ─────────────────────────────────────────────────────────────
++//  三、MEM 阶段信号
++// ─────────────────────────────────────────────────────────────
++    wire [4:0]  MEM_rd, MEM_rs2;
++    wire [31:0] MEM_RD2, MEM_aluout;
++    wire        MEM_RegWrite, MEM_MemWrite, MEM_MemRead;
++    wire [1:0]  MEM_WDSel;
++    wire [2:0]  MEM_DMType;
++    wire [31:0] MEM_pc;
++
++    assign mem_w    = MEM_MemWrite;
++    assign mem_r    = MEM_MemRead;
+     assign Addr_out = MEM_aluout;
+-	assign Data_out = memdata_wr;
+-	
+-	wire [31:0] instr;
+-	
+-	assign iimm_shamt=instr[24:20];
+-	assign iimm=instr[31:20];
+-	assign simm={instr[31:25],instr[11:7]};
+-	assign bimm={instr[31],instr[7],instr[30:25],instr[11:8]};
+-	assign uimm=instr[31:12];
+-	assign jimm={instr[31],instr[19:12],instr[20],instr[30:21]};
+-   
+-    assign Op = instr[6:0];  // instruction
+-    assign Funct7 = instr[31:25]; // funct7
+-    assign Funct3 = instr[14:12]; // funct3
+-    assign rs1 = instr[19:15];  // rs1
+-    assign rs2 = instr[24:20];  // rs2
+-    assign rd = instr[11:7];  // rd
+-    assign Imm12 = instr[31:20];// 12-bit immediate
+-    assign IMM = instr[31:12];  // 20-bit immediate
+-    
+-      
+-    wire ID_MemWrite; // MemWrite from ctrl in ID
+-    wire ID_MemRead; // MemRead from ctrl in ID
+ 
+-   // instantiation of control unit
+-	ctrl U_ctrl(
+-	    .Op(Op), .Funct7(Funct7), .Funct3(Funct3), .Zero(Zero), 
+-		.RegWrite(RegWrite), .MemWrite(ID_MemWrite), .MemRead(ID_MemRead),
+-		.EXTOp(EXTOp), .ALUOp(ALUOp), .NPCOp(NPCOp), 
+-		.ALUSrc(ALUSrc), .WDSel(WDSel)
+-	);
+- // instantiation of pc unit
+-	PC U_PC(.clk(~clk), .rst(reset), .NPC(NPC), .PC(PC_out) );
+-	NPC U_NPC(.PC(PC_out), .NPCOp(EX_NPCOp),
+-	          .IMM(EX_immout), .NPC(NPC));
+-	EXT U_EXT(
+-		.iimm(iimm), .simm(simm), 
+-		.uimm(uimm), .EXTOp(EXTOp), .immout(immout)
+-	);
+-	RF U_RF(
+-		.clk(clk), .rst(reset),
+-		.RFWr(WB_RegWrite), 
+-		.A1(rs1), .A2(rs2), .A3(WB_rd), 
+-		.WD(WD), 
+-		.RD1(RD1), .RD2(RD2)
+-	);
+-// instantiation of alu unit
+-	alu U_alu(.A(A), .B(B), .ALUOp(EX_ALUOp), .C(aluout), .Zero(Zero));
+-	
+-//please connnect the CPU by yourself
++// ─────────────────────────────────────────────────────────────
++//  四、ALU 操作数（含前推 MUX）
++// ─────────────────────────────────────────────────────────────
++    wire [31:0] aluout;
++    reg  [31:0] alu_in1, alu_in2, memdata_wr;
+ 
+-//WD MUX
+-always @(*)
+-begin
+-	case(WB_WDSel)
+-		`WDSel_FromALU: WD<=WB_aluout;
+-		`WDSel_FromMEM: WD<=WB_MemData;
+-		`WDSel_FromPC:  WD<=WB_pc+4;  //WB_pc��ǰ�漸����δ��4����Jָ��ԭʼ��ַ
+-	endcase
+-end
++    // MEM→EX 前推：WB 写回数据
++    wire [31:0] WB_wd = (WB_WDSel == `WDSel_FromALU) ? WB_aluout :
++                        (WB_WDSel == `WDSel_FromMEM)  ? WB_MemData :
++                                                         WB_pc + 4;
++    // MEM 阶段 ALU 结果（用于 MEM→EX 前推）
++    wire [31:0] MEM_wd = (MEM_WDSel == `WDSel_FromALU) ? MEM_aluout : MEM_aluout; // lw 前推用 aluout 做地址，但此处前推 ALU 结果
+ 
+-// MUX Gate 
+-    reg [31:0] alu_in1;  
+-    reg [31:0] alu_in2;  
++    // 前推选择
++    // fwd_a/b: 00=无前推, 01=MEM→EX, 10=WB→EX
++    wire [1:0] fwd_a, fwd_b;
++    assign fwd_a = (EX_rs1 != 0 && MEM_RegWrite && MEM_rd == EX_rs1) ? 2'b01 :
++                   (EX_rs1 != 0 && WB_RegWrite  && WB_rd  == EX_rs1) ? 2'b10 : 2'b00;
++    assign fwd_b = (EX_rs2 != 0 && MEM_RegWrite && MEM_rd == EX_rs2) ? 2'b01 :
++                   (EX_rs2 != 0 && WB_RegWrite  && WB_rd  == EX_rs2) ? 2'b10 : 2'b00;
+ 
+-    always @(*) 
+-    begin
+-        alu_in1 <= EX_RD1; //from regfile
+-        alu_in2 <= EX_RD2; //from regfile
++    always @(*) begin
++        case (fwd_a)
++            2'b01:   alu_in1 = MEM_aluout;
++            2'b10:   alu_in1 = WB_wd;
++            default: alu_in1 = EX_RD1;
++        endcase
+     end
+-    
+-    always @(*) 
+-        memdata_wr <= MEM_RD2;//from MEM
+-        
+-    assign A = alu_in1;
+-    assign B = (EX_ALUSrc) ? EX_immout : alu_in2;//whether from EXT
+ 
+-//-----pipe registers--------------
++    always @(*) begin
++        case (fwd_b)
++            2'b01:   alu_in2 = MEM_aluout;
++            2'b10:   alu_in2 = WB_wd;
++            default: alu_in2 = EX_RD2;
++        endcase
++    end
+ 
+-    //IF_ID: [31:0] PC [31:0]instr
+-    wire [63:0] IF_ID_in;
+-    assign IF_ID_in[31:0] = PC_out;//original addr of the current ins in ID, not PC+4
++    // 存储器写数据选择（同样需要前推）
++    always @(*) begin
++        memdata_wr = MEM_RD2;  // 默认取 MEM 阶段的 RD2
++    end
++
++    assign Data_out = memdata_wr;
++
++    wire [31:0] A = alu_in1;
++    wire [31:0] B = EX_ALUSrc ? EX_immout : alu_in2;
++
++// ─────────────────────────────────────────────────────────────
++//  五、Load-Use 阻塞检测
++// ─────────────────────────────────────────────────────────────
++    // 当 EX 阶段是 load 且其 rd == ID 阶段 rs1 或 rs2 时，需要暂停
++    wire load_use_hazard = EX_MemRead &&
++                           ((EX_rd == rs1) || (EX_rd == rs2));
++
++    wire stall = load_use_hazard;  // 暂停信号
++    wire flush_ex = stall;         // Load-Use 时 EX 阶段插气泡
++
++// ─────────────────────────────────────────────────────────────
++//  六、控制冒险冲刷（分支/jal/jalr 确认后冲刷 IF 和 ID 阶段）
++// ─────────────────────────────────────────────────────────────
++    // EX_NPCOp[0]=1 表示实际跳转（条件成立 or 无条件）
++    // 对于 JAL（NPCOp[4:1]==4'b1000）和 JALR（4'b1001），[0]也=1
++    wire branch_taken = EX_NPCOp[0];
++    wire flush_if_id  = branch_taken;  // 跳转时冲刷 IF/ID 两个流水寄存器
++
++// ─────────────────────────────────────────────────────────────
++//  七、NPC 计算
++//  EX 阶段计算跳转目标，JALR 目标 = ALU 结果（rs1+imm）& ~1
++// ─────────────────────────────────────────────────────────────
++    wire [31:0] NPC;
++    wire is_jalr = (EX_NPCOp_raw[4:1] == 4'b1001);
++    wire is_jal  = (EX_NPCOp_raw[4:1] == 4'b1000);
++    wire is_branch = !is_jalr && !is_jal && EX_NPCOp_raw[0];
++
++    // NPC 来源选择
++    wire [31:0] branch_target = EX_pc + EX_immout;           // B-type/JAL
++    wire [31:0] jalr_target   = (EX_RD1 + EX_immout) & 32'hFFFF_FFFE; // JALR
++
++    assign NPC = (branch_taken && is_jalr)  ? jalr_target   :
++                 (branch_taken)              ? branch_target :
++                                              PC_out + 4;
++
++// ─────────────────────────────────────────────────────────────
++//  八、子模块例化
++// ─────────────────────────────────────────────────────────────
++
++    // PC 寄存器（下降沿更新，与 demo 保持一致）
++    PC U_PC(
++        .clk(~clk), .rst(reset),
++        .NPC(NPC), .PC(PC_out),
++        .stall(stall)   // stall 时 PC 不更新
++    );
++
++    // 控制单元（ID 阶段）
++    ctrl U_ctrl(
++        .Op(Op), .Funct7(Funct7), .Funct3(Funct3), .Zero(Zero),
++        .RegWrite(RegWrite), .MemWrite(ID_MemWrite), .MemRead(ID_MemRead),
++        .EXTOp(EXTOp), .ALUOp(ALUOp), .NPCOp(NPCOp),
++        .ALUSrc(ALUSrc), .WDSel(WDSel)
++    );
++
++    // 立即数扩展（ID 阶段）
++    EXT U_EXT(
++        .iimm(iimm), .simm(simm), .bimm(bimm), .uimm(uimm), .jimm(jimm),
++        .EXTOp(EXTOp), .immout(immout)
++    );
++
++    // 寄存器堆（WB 写，ID 读）
++    RF U_RF(
++        .clk(clk), .rst(reset),
++        .RFWr(WB_RegWrite),
++        .A1(rs1), .A2(rs2), .A3(WB_rd),
++        .WD(WD),
++        .RD1(RD1), .RD2(RD2)
++    );
++
++    // ALU（EX 阶段）
++    alu U_alu(
++        .A(A), .B(B), .ALUOp(EX_ALUOp), .C(aluout), .Zero(Zero)
++    );
++
++    // 写回 MUX
++    always @(*) begin
++        case (WB_WDSel)
++            `WDSel_FromALU: WD = WB_aluout;
++            `WDSel_FromMEM: WD = WB_MemData;
++            `WDSel_FromPC:  WD = WB_pc + 4;  // jal/jalr 返回地址
++            default:        WD = WB_aluout;
++        endcase
++    end
++
++// ─────────────────────────────────────────────────────────────
++//  九、流水线寄存器
++// ─────────────────────────────────────────────────────────────
++
++    //--- IF/ID: 64 位 = [31:0]PC + [63:32]instr ---
++    wire [63:0] IF_ID_in, IF_ID_out;
++    assign IF_ID_in[31:0]  = PC_out;
+     assign IF_ID_in[63:32] = inst_in;
++    assign instr            = IF_ID_out[63:32];
+ 
+-    wire [63:0] IF_ID_out;
+-    assign instr = IF_ID_out[63:32];
+-    pl_reg #(.WIDTH(64))
+-    IF_ID
+-    (.clk(~clk), .rst(reset), 
+-    .in(IF_ID_in), .out(IF_ID_out));
++    pl_reg #(.WIDTH(64)) IF_ID (
++        .clk(~clk), .rst(reset | flush_if_id),
++        .stall(stall),
++        .in(IF_ID_in), .out(IF_ID_out)
++    );
+ 
++    //--- ID/EX: 200 位 ---
++    // [31:0]   PC
++    // [36:32]  rd
++    // [41:37]  rs1
++    // [46:42]  rs2
++    // [78:47]  immout
++    // [110:79] RD1
++    // [142:111] RD2
++    // [143]    RegWrite
++    // [144]    MemWrite
++    // [149:145] ALUOp
++    // [154:150] NPCOp (5 bits)
++    // [155]    ALUSrc
++    // [158:156] DMType (reserved)
++    // [160:159] WDSel
++    // [161]    MemRead
++    // [166:162] (reserved)
++    // [199:167] (reserved / future)
++    // flush 时强制 ID/EX 输入为全 0，插入气泡到 EX 阶段
++    wire [31:0] id_pc   = flush_if_id ? 32'b0 : IF_ID_out[31:0];
++    wire [4:0]  id_rd   = flush_if_id ? 5'b0  : rd;
++    wire [4:0]  id_rs1  = flush_if_id ? 5'b0  : rs1;
++    wire [4:0]  id_rs2  = flush_if_id ? 5'b0  : rs2;
++    wire [31:0] id_imm  = flush_if_id ? 32'b0 : immout;
++    wire [31:0] id_rd1  = flush_if_id ? 32'b0 : RD1;
++    wire [31:0] id_rd2  = flush_if_id ? 32'b0 : RD2;
++    wire        id_rw   = flush_if_id ? 1'b0  : RegWrite;
++    wire        id_mw   = flush_if_id ? 1'b0  : ID_MemWrite;
++    wire [4:0]  id_aluo = flush_if_id ? 5'b0  : ALUOp;
++    wire [4:0]  id_npco = flush_if_id ? 5'b0  : NPCOp;
++    wire        id_as   = flush_if_id ? 1'b0  : ALUSrc;
++    wire [1:0]  id_wds  = flush_if_id ? 2'b0  : WDSel;
++    wire        id_mr   = flush_if_id ? 1'b0  : ID_MemRead;
+ 
+-    //ID_EX
+-    wire [193:0] ID_EX_in;
+-    assign ID_EX_in[31:0] = IF_ID_out[31:0];//PC
+-    assign ID_EX_in[36:32] = rd;
+-    assign ID_EX_in[41:37] = rs1;
+-    assign ID_EX_in[46:42] = rs2;
+-    assign ID_EX_in[78:47] = immout;
+-    assign ID_EX_in[110:79] = RD1;
+-    assign ID_EX_in[142:111] = RD2;
+-    assign ID_EX_in[143] = RegWrite;//RFWr
+-    assign ID_EX_in[144] = ID_MemWrite;//DMWr
+-    assign ID_EX_in[149:145] = ALUOp;
+-    assign ID_EX_in[154:150] = NPCOp;
+-    assign ID_EX_in[155] = ALUSrc;
+-    assign ID_EX_in[158:156] = 3'b000;  //nop, reserved for mem access
+-    assign ID_EX_in[160:159] = WDSel;
+-    assign ID_EX_in[161] = ID_MemRead;
+-    assign ID_EX_in[193:162] = IF_ID_out[63:32];
++    wire [199:0] ID_EX_in, ID_EX_out;
++    assign ID_EX_in[31:0]    = id_pc;
++    assign ID_EX_in[36:32]   = id_rd;
++    assign ID_EX_in[41:37]   = id_rs1;
++    assign ID_EX_in[46:42]   = id_rs2;
++    assign ID_EX_in[78:47]   = id_imm;
++    assign ID_EX_in[110:79]  = id_rd1;
++    assign ID_EX_in[142:111] = id_rd2;
++    assign ID_EX_in[143]     = id_rw;
++    assign ID_EX_in[144]     = id_mw;
++    assign ID_EX_in[149:145] = id_aluo;
++    assign ID_EX_in[154:150] = id_npco;
++    assign ID_EX_in[155]     = id_as;
++    assign ID_EX_in[158:156] = 3'b000;
++    assign ID_EX_in[160:159] = id_wds;
++    assign ID_EX_in[161]     = id_mr;
++    assign ID_EX_in[199:162] = 38'b0;
+ 
+-    wire [193:0] ID_EX_out;
+-    //wire [31:0] EX_inst;
+-    assign EX_rd = ID_EX_out[36:32];
+-    assign EX_rs1 = ID_EX_out[41:37];
+-    assign EX_rs2 = ID_EX_out[46:42];
+-    assign EX_immout = ID_EX_out[78:47];
+-    assign EX_RD1 = ID_EX_out[110:79];
+-    assign EX_RD2 = ID_EX_out[142:111];
+-    assign EX_RegWrite = ID_EX_out[143];//RFWr
+-    assign EX_MemWrite = ID_EX_out[144];//DMWr
+-    assign EX_ALUOp = ID_EX_out[149:145];
+-    assign EX_NPCOp = {ID_EX_out[154:151], ID_EX_out[150] & Zero};
+-    assign EX_ALUSrc = ID_EX_out[155];
+-    assign EX_DMType = ID_EX_out[158:156];
+-    assign EX_WDSel = ID_EX_out[160:159];
+-    assign EX_MemRead = ID_EX_out[161];
+-    assign EX_pc = ID_EX_out[31:0];
+-    //assign EX_inst = ID_EX_out[193:162];
+-    
+-    pl_reg #(.WIDTH(194))
+-    ID_EX
+-    (.clk(~clk), .rst(reset), 
+-    .in(ID_EX_in), .out(ID_EX_out));
++    assign EX_rd           = ID_EX_out[36:32];
++    assign EX_rs1          = ID_EX_out[41:37];
++    assign EX_rs2          = ID_EX_out[46:42];
++    assign EX_immout        = ID_EX_out[78:47];
++    assign EX_RD1           = ID_EX_out[110:79];
++    assign EX_RD2           = ID_EX_out[142:111];
++    assign EX_RegWrite       = ID_EX_out[143];
++    assign EX_MemWrite       = ID_EX_out[144];
++    assign EX_ALUOp          = ID_EX_out[149:145];
++    assign EX_NPCOp_raw      = ID_EX_out[154:150];
++    assign EX_ALUSrc         = ID_EX_out[155];
++    assign EX_DMType         = ID_EX_out[158:156];
++    assign EX_WDSel          = ID_EX_out[160:159];
++    assign EX_MemRead        = ID_EX_out[161];
++    assign EX_pc             = ID_EX_out[31:0];
+ 
+-    
+-    //EX_MEM
+-    wire [145:0] EX_MEM_in;
+-    assign EX_MEM_in[31:0] = ID_EX_out[31:0];//PC
+-    assign EX_MEM_in[36:32] = EX_rd;//rd
+-    assign EX_MEM_in[68:37] = alu_in2;//RD2 updated!!!
++    pl_reg #(.WIDTH(200)) ID_EX (
++        .clk(~clk), .rst(reset | flush_ex),
++        .stall(1'b0),
++        .in(ID_EX_in), .out(ID_EX_out)
++    );
++
++    //--- EX/MEM: 146 位（与 demo 兼容） ---
++    wire [145:0] EX_MEM_in, EX_MEM_out;
++    assign EX_MEM_in[31:0]   = EX_pc;
++    assign EX_MEM_in[36:32]  = EX_rd;
++    assign EX_MEM_in[68:37]  = alu_in2;    // RD2 (after forwarding)
+     assign EX_MEM_in[100:69] = aluout;
+-    assign EX_MEM_in[101] = EX_RegWrite;
+-    assign EX_MEM_in[102] = EX_MemWrite;
+-    assign EX_MEM_in[105:103] = EX_DMType;
+-    assign EX_MEM_in[107:106] = EX_WDSel;
+-    assign EX_MEM_in[112:108] = EX_rs2;
+-    assign EX_MEM_in[113] = EX_MemRead;
+-    assign EX_MEM_in[145:114] = ID_EX_out[193:162];
++    assign EX_MEM_in[101]    = EX_RegWrite;
++    assign EX_MEM_in[102]    = EX_MemWrite;
++    assign EX_MEM_in[105:103]= EX_DMType;
++    assign EX_MEM_in[107:106]= EX_WDSel;
++    assign EX_MEM_in[112:108]= EX_rs2;
++    assign EX_MEM_in[113]    = EX_MemRead;
++    assign EX_MEM_in[145:114]= 32'b0;
+ 
+-    wire [145:0] EX_MEM_out;
+-    assign MEM_rd = EX_MEM_out[36:32];
+-    assign MEM_RD2 = EX_MEM_out[68:37];
+-    assign MEM_aluout = EX_MEM_out[100:69];
+-    assign MEM_RegWrite = EX_MEM_out[101];
+-    assign MEM_MemWrite = EX_MEM_out[102];
+-    assign MEM_DMType = EX_MEM_out[105:103];
+-    assign MEM_WDSel = EX_MEM_out[107:106];
+-    assign MEM_rs2 = EX_MEM_out[112:108];
+-    assign MEM_MemRead = EX_MEM_out[113];  
+-    //assign MEM_inst = EX_MEM_out[145:114];  
+- 
+-    pl_reg #(.WIDTH(146))
+-    EX_MEM
+-    (.clk(~clk), .rst(reset), 
+-    .in(EX_MEM_in), .out(EX_MEM_out));
+-    
++    assign MEM_rd       = EX_MEM_out[36:32];
++    assign MEM_RD2      = EX_MEM_out[68:37];
++    assign MEM_aluout   = EX_MEM_out[100:69];
++    assign MEM_RegWrite  = EX_MEM_out[101];
++    assign MEM_MemWrite  = EX_MEM_out[102];
++    assign MEM_DMType    = EX_MEM_out[105:103];
++    assign MEM_WDSel    = EX_MEM_out[107:106];
++    assign MEM_rs2       = EX_MEM_out[112:108];
++    assign MEM_MemRead   = EX_MEM_out[113];
++    assign MEM_pc        = EX_MEM_out[31:0];
+ 
+-    //MEM_WB
+-    wire [135:0] MEM_WB_in;
+-    wire [31:0] WB_inst;
+-    assign MEM_WB_in[31:0] = EX_MEM_out[31:0]; //PC
+-    assign MEM_WB_in[36:32] = MEM_rd;
+-    assign MEM_WB_in[68:37] = MEM_aluout;
+-    assign MEM_WB_in[100:69] = Data_in;  //data from dmem
+-    assign MEM_WB_in[101] = MEM_RegWrite;
+-    assign MEM_WB_in[103:102] = MEM_WDSel;
+-    assign MEM_WB_in[135:104] = EX_MEM_out[145:114];
+- 
+-    wire [135:0] MEM_WB_out;
+-    assign WB_pc = MEM_WB_out[31:0];
+-    assign WB_rd = MEM_WB_out[36:32];
+-    assign WB_aluout = MEM_WB_out[68:37];
+-    assign WB_MemData = MEM_WB_out[100:69];
+-    assign WB_RegWrite = MEM_WB_out[101];
+-    assign WB_WDSel = MEM_WB_out[103:102];
+-    assign WB_inst = MEM_WB_out[135:104];
++    pl_reg #(.WIDTH(146)) EX_MEM (
++        .clk(~clk), .rst(reset),
++        .stall(1'b0),
++        .in(EX_MEM_in), .out(EX_MEM_out)
++    );
+ 
+-    pl_reg #(.WIDTH(136))
+-    MEM_WB
+-    (.clk(~clk), .rst(reset), 
+-    .in(MEM_WB_in), .out(MEM_WB_out));
++    //--- MEM/WB: 136 位 ---
++    wire [135:0] MEM_WB_in, MEM_WB_out;
++    assign MEM_WB_in[31:0]   = MEM_pc;
++    assign MEM_WB_in[36:32]  = MEM_rd;
++    assign MEM_WB_in[68:37]  = MEM_aluout;
++    assign MEM_WB_in[100:69] = Data_in;
++    assign MEM_WB_in[101]    = MEM_RegWrite;
++    assign MEM_WB_in[103:102]= MEM_WDSel;
++    assign MEM_WB_in[135:104]= 32'b0;
+ 
++    assign WB_pc        = MEM_WB_out[31:0];
++    assign WB_rd        = MEM_WB_out[36:32];
++    assign WB_aluout    = MEM_WB_out[68:37];
++    assign WB_MemData   = MEM_WB_out[100:69];
++    assign WB_RegWrite   = MEM_WB_out[101];
++    assign WB_WDSel     = MEM_WB_out[103:102];
++
++    pl_reg #(.WIDTH(136)) MEM_WB (
++        .clk(~clk), .rst(reset),
++        .stall(1'b0),
++        .in(MEM_WB_in), .out(MEM_WB_out)
++    );
++
+ endmodule
++
++// ─────────────────────────────────────────────────────────────
++//  PC 寄存器（支持 stall）
++// ─────────────────────────────────────────────────────────────
++module PC(
++    input         clk,
++    input         rst,
++    input         stall,
++    input  [31:0] NPC,
++    output reg [31:0] PC
++);
++    always @(posedge clk or posedge rst) begin
++        if (rst)        PC <= 32'b0;
++        else if (!stall) PC <= NPC;
++    end
++endmodule
++
++// ─────────────────────────────────────────────────────────────
++//  通用流水线寄存器（支持 stall 和同步复位/冲刷）
++// ─────────────────────────────────────────────────────────────
++module pl_reg #(parameter WIDTH = 32)(
++    input              clk,
++    input              rst,    // 同步复位（冲刷时置1）
++    input              stall,  // 阻塞时保持不变
++    input  [WIDTH-1:0] in,
++    output reg [WIDTH-1:0] out
++);
++    always @(posedge clk) begin
++        if (rst)        out <= {WIDTH{1'b0}};
++        else if (!stall) out <= in;
++    end
++endmodule
+
+--- a/pipeline/RF.v
++++ b/pipeline/RF.v
+@@ -1,34 +1,29 @@
+-module RF(     input         clk, 
+-               input         rst,
+-               input         RFWr, 
+-               input  [4:0]  A1, A2, A3, 
+-               input  [31:0] WD, 
+-               output [31:0] RD1, RD2
+-               //input [4:0] reg_sel,
+-               //output [31:0] reg_data
+-         );
++module RF(
++    input         clk, 
++    input         rst,
++    input         RFWr, 
++    input  [4:0]  A1, A2, A3, 
++    input  [31:0] WD, 
++    output [31:0] RD1, RD2
++);
+ 
+   reg [31:0] rf[31:0];
+   integer i;
+ 
+-  //warning: posedge
+   always @(posedge clk, posedge rst) begin
+     if (rst) begin    
+        for (i=1; i<32; i=i+1)
+            rf[i] <= 0;
+     end
+-      
+     else 
+       if (RFWr) begin
+-        if(A3 != 5'b0)begin
++        if(A3 != 5'b0) begin
+             rf[A3] <= WD;
+-            //$write("x%d = %h  ", A3, WD);
+-	      end
++        end
+       end
+   end
+ 
+   assign RD1 = (A1 != 0) ? rf[A1] : 0;
+   assign RD2 = (A2 != 0) ? rf[A2] : 0;
+-  //assign reg_data = (reg_sel != 0) ? rf[reg_sel] : 0; 
+ 
+-endmodule 
++endmodule
+
+--- a/pipeline/SCCPU.v
++++ b/pipeline/SCCPU.v
+@@ -0,0 +1,102 @@
++`include "ctrl_encode_def.v"
++module SCCPU(
++    input      clk,            // clock
++    input      reset,          // reset
++    input [31:0]  inst_in,     // instruction
++    input [31:0]  Data_in,     // data from data memory
++   
++    output    mem_w,          // output: memory write signal
++    output [31:0] PC_out,     // PC address
++      // memory write
++    output [31:0] Addr_out,   // ALU output
++    output [31:0] Data_out,   // data to write data memory
++
++    input  [4:0] reg_sel,    // register selection (for debug use)
++    output [31:0] reg_data  // selected register data (for debug use)
++    );
++
++    wire        RegWrite;    // control signal to register write
++    wire [5:0]  EXTOp;       // control signal to signed extension
++    wire [4:0]  ALUOp;       // ALU opertion
++    wire [2:0]  NPCOp;       // next PC operation
++    wire [1:0]  WDSel;       // (register) write data selection
++    wire        ALUSrc;      // ALU source for B
++    wire        Zero;        // ALU ouput zero
++    wire [31:0] NPC;         // next PC
++    wire [4:0]  rs1;          // rs
++    wire [4:0]  rs2;          // rt
++    wire [4:0]  rd;          // rd
++    wire [6:0]  Op;          // opcode
++    wire [6:0]  Funct7;       // funct7
++    wire [2:0]  Funct3;       // funct3
++    wire [11:0] Imm12;       // 12-bit immediate
++    wire [31:0] Imm32;       // 32-bit immediate
++    wire [19:0] IMM;         // 20-bit immediate (address)
++    wire [4:0]  A3;          // register address for write
++    reg  [31:0] WD;          // register write data
++    wire [31:0] RD1,RD2;     // register data specified by rs
++    wire [31:0] B;           // operator for ALU B
++	
++	wire [4:0]  iimm_shamt;
++	wire [11:0] iimm,simm,bimm;
++	wire [19:0] uimm,jimm;
++	wire [31:0] immout;
++    wire [31:0] aluout;
++    
++    assign Addr_out=aluout;
++	assign B = (ALUSrc) ? immout : RD2;
++	assign Data_out = RD2;
++	
++	assign iimm=inst_in[31:20];
++	assign simm={inst_in[31:25],inst_in[11:7]};
++	assign uimm=inst_in[31:12];
++	assign bimm={inst_in[31],inst_in[7],inst_in[30:25],inst_in[11:8]};
++	assign jimm={inst_in[31],inst_in[19:12],inst_in[20],inst_in[30:21]};
++
++    assign Op = inst_in[6:0];  // instruction
++    assign Funct7 = inst_in[31:25]; // funct7
++    assign Funct3 = inst_in[14:12]; // funct3
++    assign rs1 = inst_in[19:15];  // rs1
++    assign rs2 = inst_in[24:20];  // rs2
++    assign rd = inst_in[11:7];  // rd
++    assign Imm12 = inst_in[31:20];// 12-bit immediate
++    assign IMM = inst_in[31:12];  // 20-bit immediate
++   
++   // instantiation of control unit
++	ctrl U_ctrl(
++		.Op(Op), .Funct7(Funct7), .Funct3(Funct3), .Zero(Zero), 
++		.RegWrite(RegWrite), .MemWrite(mem_w),
++		.EXTOp(EXTOp), .ALUOp(ALUOp), .NPCOp(NPCOp), 
++		.ALUSrc(ALUSrc), .WDSel(WDSel)
++	);
++ // instantiation of pc unit
++	PC  U_PC(.clk(clk), .rst(reset), .NPC(NPC), .PC(PC_out) );
++	NPC U_NPC(.PC(PC_out), .NPCOp(NPCOp), .IMM(immout), .RS1(RD1), .NPC(NPC));
++	EXT U_EXT(
++		.iimm(iimm), .simm(simm), .bimm(bimm), .uimm(uimm), .jimm(jimm),
++		.EXTOp(EXTOp), .immout(immout)
++	);
++	RF U_RF(
++		.clk(clk), .rst(reset),
++		.RFWr(RegWrite), 
++		.A1(rs1), .A2(rs2), .A3(rd), 
++		.WD(WD), 
++		.RD1(RD1), .RD2(RD2),
++		.reg_sel(reg_sel),
++		.reg_data(reg_data)
++	);
++// instantiation of alu unit
++	alu U_alu(.A(RD1), .B(B), .ALUOp(ALUOp), .C(aluout), .Zero(Zero));
++
++//please connnect the CPU by yourself
++always @*
++begin
++	case(WDSel)
++		`WDSel_FromALU: WD<=aluout;
++		`WDSel_FromMEM: WD<=Data_in;
++        `WDSel_FromPC:  WD<=PC_out+4;
++        default: WD<=aluout;
++	endcase
++end
++
++endmodule
